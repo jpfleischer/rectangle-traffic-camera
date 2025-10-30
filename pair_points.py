@@ -1,215 +1,814 @@
-# pair_points_zoom.py
-# CAMERA (top) is static. ORTHO (bottom) is zoomable (+/-) and pannable (arrows/WASD).
-# Click CAM then the matching point in ORTHO. 'u' undo, 's' solve/save, 'q' quit.
+#!/usr/bin/env python3
+# pair_points.py — resizable panes, hover-targeted pan/zoom, robust homography
+# NEW:
+#  - USAC/MAGSAC++ upgrade (fallback to RANSAC)
+#  - "Load Points" button; Solve&Save also saves points to JSON
+#  - Result panel with inlier stats (count, %, RMSE, median, P95, method, thr)
+#  - Camera pane colored by inlier/outlier after solve (like ortho)
 
-import cv2
+import sys, json, time
 import numpy as np
+import cv2
 import rasterio as rio
+from rasterio.enums import Resampling
+from PySide6 import QtCore, QtGui, QtWidgets
 
+# ---- I/O paths ----
 CAM_PATH   = "camera_frame.png"
 ORTHO_PATH = "ortho_zoom.tif"
 H_OUT      = "H_cam_to_map.npy"
 WARP_OUT   = "camera_warped_to_ortho.png"
+PTS_OUT    = "pairs_cam_to_map.json"   # <-- points saved/loaded here
 
-# ---------------- load camera ----------------
-cam_bgr = cv2.imread(CAM_PATH)
-if cam_bgr is None:
-    raise SystemExit(f"Couldn't read {CAM_PATH}")
-cam_h, cam_w = cam_bgr.shape[:2]
+# ---- robust estimator settings ----
+H_METHOD = getattr(cv2, "USAC_MAGSAC", cv2.RANSAC)  # prefer MAGSAC++
+RANSAC_THRESH   = 10.0   # reprojection threshold in *ortho pixels* (tune 2–4)
+MAX_ITERS       = 10000
+CONFIDENCE      = 0.999
+REFINE_ITERS    = 10
 
-# ---------------- load ortho (GeoTIFF -> 8-bit RGB) ----------------
-with rio.open(ORTHO_PATH) as src:
-    nodata = src.nodata
-    bands = [1,2,3] if src.count >= 3 else [1]
-    arr = src.read(bands)            # (C,H,W)
-    arr = np.moveaxis(arr, 0, 2)     # (H,W,C)
+ACTIVE_BORDER   = "QLabel { border: 2px solid #4da3ff; }"
+INACTIVE_BORDER = "QLabel { border: 1px solid #555; }"
+
+# ---------- utilities ----------
+def to_8bit_rgb(arr, nodata=None):
     if arr.ndim == 2:
-        arr = np.stack([arr,arr,arr], 2)
+        arr = np.stack([arr, arr, arr], axis=2)
     elif arr.shape[2] == 1:
         arr = np.repeat(arr, 3, axis=2)
+    if arr.dtype == np.uint8:
+        return arr
+    o = arr.astype(np.float32, copy=True)
+    mask = None
+    if nodata is not None:
+        mask = np.any(arr == nodata, axis=2)
+    def pct(ch):
+        if mask is not None:
+            vals = ch[~mask]
+            if vals.size == 0: return 0.0, 1.0
+            lo, hi = np.percentile(vals, (1, 99))
+        else:
+            lo, hi = np.percentile(ch, (1, 99))
+        if hi <= lo: hi = lo + 1.0
+        return lo, hi
+    for c in range(o.shape[2]):
+        lo, hi = pct(o[..., c])
+        o[..., c] = np.clip((o[..., c] - lo) / (hi - lo) * 255.0, 0, 255)
+    return o.astype(np.uint8, copy=False)
 
-    if arr.dtype != np.uint8:
-        o = arr.astype(np.float32)
-        mask = np.any(arr == nodata, axis=2) if nodata is not None else None
-        for c in range(o.shape[2]):
-            ch = o[..., c]
-            vals = ch[~mask] if mask is not None else ch
-            if vals.size == 0:
-                lo, hi = 0, 255
-            else:
-                lo, hi = np.percentile(vals, (1, 99))
-                if hi <= lo: hi = lo + 1.0
-            o[..., c] = np.clip((ch - lo) / (hi - lo) * 255.0, 0, 255)
-        ortho_rgb = o.astype(np.uint8)
-    else:
-        ortho_rgb = arr
+def cv_bgr_to_qimage(bgr: np.ndarray) -> QtGui.QImage:
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    h, w, ch = rgb.shape
+    return QtGui.QImage(rgb.data, w, h, ch * w, QtGui.QImage.Format_RGB888).copy()
 
-ortho_h, ortho_w = ortho_rgb.shape[:2]
+def clamp(v, lo, hi): return max(lo, min(hi, v))
 
-# ---------------- layout + state ----------------
-MAX_W, MAX_H = 1500, 900  # window cap; tweak to your screen
+# ---------- clickable / hoverable label ----------
+class ClickLabel(QtWidgets.QLabel):
+    clicked = QtCore.Signal(int, int)   # x, y in widget coords
+    hovered = QtCore.Signal(bool)       # True on enter, False on leave
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        self.setMouseTracking(True)
+        self.setMinimumSize(150, 120)
+    def mousePressEvent(self, e: QtGui.QMouseEvent) -> None:
+        if e.button() == QtCore.Qt.LeftButton:
+            pos = e.position() if hasattr(e, "position") else e.localPos()
+            self.clicked.emit(int(pos.x()), int(pos.y()))
+        super().mousePressEvent(e)
+    def enterEvent(self, e: QtCore.QEvent) -> None:
+        self.hovered.emit(True);  super().enterEvent(e)
+    def leaveEvent(self, e: QtCore.QEvent) -> None:
+        self.hovered.emit(False); super().leaveEvent(e)
 
-def fit_size(w, h, max_w, max_h):
-    s = min(max_w / w, max_h / h, 1.0)
-    return int(w * s), int(h * s), s
+# ---------- main widget ----------
+class PairPointsGUI(QtWidgets.QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Pair points — robust + save/load + stats")
+        self.resize(1400, 900)
 
-# camera shown at fixed reasonable size
-cam_wd, cam_hd, cam_scale = fit_size(cam_w, cam_h, MAX_W, MAX_H // 2)
-cam_disp = cv2.resize(cam_bgr, (cam_wd, cam_hd), interpolation=cv2.INTER_AREA)
+        # ---- load camera ----
+        cam_bgr = cv2.imread(CAM_PATH, cv2.IMREAD_COLOR)
+        if cam_bgr is None:
+            raise SystemExit(f"Could not read {CAM_PATH}")
+        self.cam_bgr = cam_bgr
+        self.cam_h, self.cam_w = cam_bgr.shape[:2]
 
-# ORTHO interactive view state
-base_wd, base_hd, base_scale = fit_size(ortho_w, ortho_h, MAX_W, MAX_H // 2)
-zoom = 2.0      # start with 2x zoom so features are bigger
-pan_x = 0       # pan offsets in *resized* pixels (after base_scale*zoom)
-pan_y = 0
+        # ---- load ortho (preview for display; keep full size meta) ----
+        with rio.open(ORTHO_PATH) as src:
+            self.ortho_w, self.ortho_h = src.width, src.height
+            nodata = src.nodata
+            bands = [1, 2, 3] if src.count >= 3 else [1]
+            self.prev_w = min(3000, self.ortho_w)
+            self.prev_h = max(1, int(round(self.ortho_h * (self.prev_w / self.ortho_w))))
+            prev = src.read(bands, out_shape=(len(bands), self.prev_h, self.prev_w),
+                            resampling=Resampling.bilinear)
+            prev = np.moveaxis(prev, 0, 2)  # HWC
+            o8 = to_8bit_rgb(prev, nodata=nodata)
+            self.ortho_bgr_base = cv2.cvtColor(o8, cv2.COLOR_RGB2BGR)
+            self.prev_scale = self.prev_w / float(self.ortho_w)  # original->preview scale
 
-# interaction state
-cam_pts = []   # original camera pixels (x,y)
-map_pts = []   # original ortho pixels  (x,y)
-FONT = cv2.FONT_HERSHEY_SIMPLEX
+        # ---- pairing/interaction state ----
+        self.cam_pts, self.map_pts = [], []
+        self.inlier_mask = None
+        # per-pane zoom/pan
+        self.cam_zoom, self.cam_pan_x, self.cam_pan_y = 1.0, 0, 0
+        self.ortho_zoom, self.ortho_pan_x, self.ortho_pan_y = 2.0, 0, 0
+        self.active_pane = 'ortho'  # 'cam' or 'ortho'
+        self._shortcuts = []
 
-def make_ortho_view():
-    """Return (view_bgr, view_w, view_h, eff_scale) and clamp pan."""
-    global pan_x, pan_y
-    eff_scale = base_scale * zoom
-    big_w = max(1, int(round(ortho_w * eff_scale)))
-    big_h = max(1, int(round(ortho_h * eff_scale)))
-    big = cv2.resize(ortho_rgb, (big_w, big_h), interpolation=cv2.INTER_LINEAR)
-    big = cv2.cvtColor(big, cv2.COLOR_RGB2BGR)
+        self.cam_path = CAM_PATH  # track current camera image path for saving metadata
 
-    view_w = min(MAX_W, big_w)
-    view_h = min(MAX_H // 2, big_h)
 
-    pan_x = max(0, min(pan_x, big_w - view_w))
-    pan_y = max(0, min(pan_y, big_h - view_h))
+        # ---- build UI ----
+        self._build_ui()
+        self._connect_signals()
+        # Coalesced redraw timer (prevents eventFilter storms during resize)
+        self._redraw_timer = QtCore.QTimer(self)
+        self._redraw_timer.setSingleShot(True)
+        self._redraw_timer.timeout.connect(self.redraw_all)
 
-    view = big[pan_y:pan_y+view_h, pan_x:pan_x+view_w].copy()
-    return view, view_w, view_h, eff_scale
+        self._update_status()
+        self.redraw_all()
 
-def disp_to_ortho_px(x_disp, y_disp, eff_scale):
-    x_big = pan_x + x_disp
-    y_big = pan_y + y_disp
-    x_px = int(round(x_big / eff_scale))
-    y_px = int(round(y_big / eff_scale))
-    x_px = max(0, min(ortho_w - 1, x_px))
-    y_px = max(0, min(ortho_h - 1, y_px))
-    return x_px, y_px
+    # ---------- UI ----------
+    def _build_ui(self):
+        root = QtWidgets.QHBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(8)
 
-# canvas and ROIs (recomputed each redraw)
-sep = 16
-ortho_view, ortho_vw, ortho_vh, eff_scale = make_ortho_view()
-canvas_h = cam_hd + sep + ortho_vh
-canvas_w = max(cam_wd, ortho_vw)
-canvas = np.full((canvas_h, canvas_w, 3), 20, np.uint8)
+        # Left: vertical splitter (camera over ortho)
+        self.vsplit = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        self.vsplit.setChildrenCollapsible(False)
 
-def rois():
-    cam_roi   = (0, 0, cam_wd, cam_hd)
-    ortho_roi = (0, cam_hd + sep, ortho_vw, ortho_vh)
-    return cam_roi, ortho_roi
+        self.cam_label = ClickLabel()
+        self.cam_label.setStyleSheet(INACTIVE_BORDER)
+        self.cam_label.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
 
-def draw_canvas():
-    global ortho_view, ortho_vw, ortho_vh, eff_scale
-    ortho_view, ortho_vw, ortho_vh, eff_scale = make_ortho_view()
-    ch = cam_hd + sep + ortho_vh
-    cw = max(cam_wd, ortho_vw)
-    canv = np.full((ch, cw, 3), 20, np.uint8)
-    canv[0:cam_hd, 0:cam_wd] = cam_disp
-    canv[cam_hd+sep:cam_hd+sep+ortho_vh, 0:ortho_vw] = ortho_view
-    return canv
+        self.ortho_label = ClickLabel()
+        self.ortho_label.setStyleSheet(ACTIVE_BORDER)
+        self.ortho_label.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
 
-def add_mark(img, pt, idx, color):
-    cv2.circle(img, pt, 5, color, -1)
-    cv2.putText(img, str(idx), (pt[0]+6, pt[1]-6), FONT, 0.6, color, 1, cv2.LINE_AA)
+        self.vsplit.addWidget(self.cam_label)
+        self.vsplit.addWidget(self.ortho_label)
+        self.vsplit.setStretchFactor(0, 2)
+        self.vsplit.setStretchFactor(1, 3)
 
-def redraw():
-    canv = draw_canvas()
-    cam_roi, ortho_roi = rois()
-    # re-draw markers in display coordinates
-    for i, (x,y) in enumerate(cam_pts, 1):
-        add_mark(canv, (int(x * cam_scale), int(y * cam_scale)), i, (0,255,0))
-    for i, (x,y) in enumerate(map_pts, 1):
-        x_big = int(round(x * eff_scale)); y_big = int(round(y * eff_scale))
-        x_disp = x_big - pan_x
-        y_disp = y_big - pan_y
-        if 0 <= x_disp < ortho_vw and 0 <= y_disp < ortho_vh:
-            add_mark(canv, (x_disp + ortho_roi[0], y_disp + ortho_roi[1]), i, (0,200,255))
+        # Right panel (fixed-ish)
+        self.right_panel = QtWidgets.QWidget()
+        self.right_panel.setMinimumWidth(340)
+        self.right_panel.setMaximumWidth(700)
+        self.right_panel.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Expanding)
 
-    tmp = canv.copy()
-    msg = f"Pairs: {min(len(cam_pts), len(map_pts))} | Zoom:{zoom:.2f} | Pan:({pan_x},{pan_y}) | Keys: +/- zoom, arrows/WASD pan, u undo, s solve, q quit"
-    cv2.putText(tmp, msg, (20, 30), FONT, 0.7, (255,255,255), 2, cv2.LINE_AA)
-    cv2.imshow(WIN, tmp)
+        right = QtWidgets.QVBoxLayout(self.right_panel)
+        right.setContentsMargins(0, 0, 0, 0)
+        right.setSpacing(10)
+        right.addWidget(QtWidgets.QLabel("<b>Controls</b>"))
 
-# mouse callback (set once)
-def on_mouse(event, x, y, flags, param):
-    if event != cv2.EVENT_LBUTTONDOWN:
-        return
-    cam_roi, ortho_roi = rois()
-    cx, cy, cw, ch = cam_roi
-    ox, oy, ow, oh = ortho_roi
-    # camera click?
-    if cx <= x < cx+cw and cy <= y < cy+ch:
-        x_px = int((x - cx) / cam_scale)
-        y_px = int((y - cy) / cam_scale)
-        cam_pts.append([x_px, y_px])
-        return
-    # ortho click?
-    if ox <= x < ox+ow and oy <= y < oy+oh:
-        x_px, y_px = disp_to_ortho_px(x - ox, y - oy, eff_scale)
-        map_pts.append([x_px, y_px])
-        return
+        # Zoom group
+        zoom_box = QtWidgets.QGroupBox("Zoom (pane under mouse)")
+        zl = QtWidgets.QGridLayout(zoom_box)
+        self.btn_zoom_in  = QtWidgets.QPushButton("Zoom In  (+/=)")
+        self.btn_zoom_out = QtWidgets.QPushButton("Zoom Out (-)")
+        zl.addWidget(self.btn_zoom_in,  0, 0)
+        zl.addWidget(self.btn_zoom_out, 0, 1)
+        right.addWidget(zoom_box)
 
-WIN = "Pair points (top=CAM, bottom=ORTHO)"
-cv2.namedWindow(WIN, cv2.WINDOW_NORMAL)
-cv2.resizeWindow(WIN, min(MAX_W, cam_wd), min(MAX_H, cam_hd + sep + ortho_vh))
-cv2.setMouseCallback(WIN, on_mouse)
+        # Pan group
+        pan_box = QtWidgets.QGroupBox("Pan (pane under mouse)")
+        pl = QtWidgets.QGridLayout(pan_box)
+        self.btn_pan_up    = QtWidgets.QPushButton("Up    (W/↑)")
+        self.btn_pan_left  = QtWidgets.QPushButton("Left  (A/←)")
+        self.btn_pan_right = QtWidgets.QPushButton("Right (D/→)")
+        self.btn_pan_down  = QtWidgets.QPushButton("Down  (S/↓)")
+        pl.addWidget(self.btn_pan_up,    0, 1)
+        pl.addWidget(self.btn_pan_left,  1, 0)
+        pl.addWidget(self.btn_pan_right, 1, 2)
+        pl.addWidget(self.btn_pan_down,  2, 1)
+        right.addWidget(pan_box)
 
-# ---------------- main loop ----------------
-while True:
-    redraw()
-    k = cv2.waitKey(30) & 0xFF
+        # Actions
+        act_box = QtWidgets.QGroupBox("Actions")
+        al = QtWidgets.QVBoxLayout(act_box)
+        self.btn_load = QtWidgets.QPushButton("Load Points…")
+        self.btn_undo  = QtWidgets.QPushButton("Undo last point (U)")
+        self.btn_solve = QtWidgets.QPushButton("Solve & Save (S)")
+        self.btn_solve_pwa = QtWidgets.QPushButton("Solve (piecewise, exact)")
+        self.btn_solve_robust = QtWidgets.QPushButton("Solve (robust, RANSAC/USAC)")
 
-    if k == ord('q'):
-        break
-    # Zoom
-    if k in (ord('+'), ord('=')):  # zoom in
-        zoom = min(16.0, zoom * 1.25)
-    if k == ord('-'):              # zoom out
-        zoom = max(0.25, zoom / 1.25)
-    # Pan
-    step = 50
-    if k in (81, ord('a')): pan_x -= step   # left
-    if k in (83, ord('d')): pan_x += step   # right
-    if k in (82, ord('w')): pan_y -= step   # up
-    if k in (84, ord('s')): pan_y += step   # down
+        self.btn_swap_cam = QtWidgets.QPushButton("Swap Camera Image…")
 
-    # Undo
-    if k == ord('u'):
-        if len(cam_pts) > len(map_pts):
-            cam_pts.pop()
-        elif len(map_pts) > len(cam_pts):
-            map_pts.pop()
-        elif cam_pts:
-            cam_pts.pop(); map_pts.pop()
+        self.btn_quit  = QtWidgets.QPushButton("Quit (Q)")
 
-    # Solve
-    if k == ord('s'):
-        n = min(len(cam_pts), len(map_pts))
+        al.addWidget(self.btn_load)
+        al.addWidget(self.btn_undo)
+        al.addWidget(self.btn_solve)
+        al.addWidget(self.btn_solve_pwa)
+        al.addWidget(self.btn_solve_robust)
+
+        al.addWidget(self.btn_swap_cam)
+        al.addWidget(self.btn_quit)
+        right.addWidget(act_box)
+
+        # Status + results
+        self.status_lbl = QtWidgets.QLabel()
+        self.status_lbl.setWordWrap(True)
+        right.addWidget(self.status_lbl)
+
+        self.results_box = QtWidgets.QGroupBox("Last solve: details")
+        rl = QtWidgets.QVBoxLayout(self.results_box)
+        self.results_lbl = QtWidgets.QLabel("—")
+        self.results_lbl.setWordWrap(True)
+        rl.addWidget(self.results_lbl)
+        self.results_box.setVisible(False)
+        right.addWidget(self.results_box)
+
+        # Help
+        help_box = QtWidgets.QGroupBox("Shortcuts")
+        hl = QtWidgets.QVBoxLayout(help_box)
+        hl.addWidget(QtWidgets.QLabel(
+            "Hover decides target pane (highlighted).\n"
+            "Zoom: +/= in, - out.  Pan: arrows or WASD.\n"
+            "Click top (CAM) then bottom (ORTHO) to pair.\n"
+            "U undo, S solve/save, Q quit."
+        ))
+        right.addWidget(help_box)
+        right.addStretch(1)
+
+        # Horizontal splitter
+        self.hsplit = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        self.hsplit.setChildrenCollapsible(False)
+        self.hsplit.addWidget(self.vsplit)
+        self.hsplit.addWidget(self.right_panel)
+        self.hsplit.setStretchFactor(0, 1)
+        self.hsplit.setStretchFactor(1, 0)
+        self.hsplit.setSizes([1000, 360])
+
+        root.addWidget(self.hsplit)
+
+    def _connect_signals(self):
+        # Hover selects active
+        self.cam_label.hovered.connect(lambda on: self._set_active('cam' if on else None))
+        self.ortho_label.hovered.connect(lambda on: self._set_active('ortho' if on else None))
+
+        # Clicks
+        self.cam_label.clicked.connect(self._on_cam_click)
+        self.ortho_label.clicked.connect(self._on_ortho_click)
+
+        # Buttons
+        self.btn_zoom_in.clicked.connect(lambda: self._zoom_active(1.25))
+        self.btn_zoom_out.clicked.connect(lambda: self._zoom_active(1/1.25))
+        self.btn_pan_left.clicked.connect(lambda: self._pan_active(-1, 0))
+        self.btn_pan_right.clicked.connect(lambda: self._pan_active(1, 0))
+        self.btn_pan_up.clicked.connect(lambda: self._pan_active(0, -1))
+        self.btn_pan_down.clicked.connect(lambda: self._pan_active(0, 1))
+        self.btn_undo.clicked.connect(self._undo)
+        self.btn_solve.clicked.connect(self._solve_and_save)
+        self.btn_solve_pwa.clicked.connect(self._solve_piecewise_and_save)
+        self.btn_solve_robust.clicked.connect(self._solve_robust_and_save)
+
+        self.btn_swap_cam.clicked.connect(self._swap_camera_image)
+
+        self.btn_quit.clicked.connect(self.close)
+        self.btn_load.clicked.connect(self._load_points_dialog)
+
+        # Redraw on splitter moves / resizes
+        self.hsplit.splitterMoved.connect(lambda *_: self.redraw_all())
+        self.vsplit.splitterMoved.connect(lambda *_: self.redraw_all())
+        self.installEventFilter(self)
+
+        # Keyboard shortcuts (keep refs)
+        def sc(key, slot):
+            s = QtGui.QShortcut(QtGui.QKeySequence(key), self)
+            s.activated.connect(slot); self._shortcuts.append(s)
+        def sc_pan(key, dx, dy):
+            s = QtGui.QShortcut(QtGui.QKeySequence(key), self)
+            s.activated.connect(lambda dx=dx, dy=dy: self._pan_active(dx, dy))
+            self._shortcuts.append(s)
+
+        sc("Q", self.close)
+        for k in ["+", "=", "]"]: sc(k, lambda f=1.25: self._zoom_active(f))
+        for k in ["-", "["]:      sc(k, lambda f=1/1.25: self._zoom_active(f))
+        for ks, dx, dy in [
+            ("Left", -1, 0), ("A", -1, 0),
+            ("Right", 1, 0), ("D", 1, 0),
+            ("Up", 0, -1), ("W", 0, -1),
+            ("Down", 0, 1), ("S", 0, 1),
+        ]: sc_pan(ks, dx, dy)
+        sc("U", self._undo)
+        sc("S", self._solve_and_save)
+
+    # ---- event filter: redraw on window resize ----
+    def eventFilter(self, obj, ev):
+        # Coalesce rapid resize events: redraw once after a short delay (16 ms)
+        if ev.type() == QtCore.QEvent.Resize:
+            if self._redraw_timer.isActive():
+                self._redraw_timer.stop()
+            self._redraw_timer.start(16)  # ~60 FPS cap
+            return False  # let Qt continue normal processing
+        return super().eventFilter(obj, ev)
+    
+
+    def _swap_camera_image(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Choose new camera image", ".", "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)"
+        )
+        if not path:
+            return
+        img = cv2.imread(path, cv2.IMREAD_COLOR)
+        if img is None:
+            QtWidgets.QMessageBox.critical(self, "Load failed", f"Could not read image:\n{path}")
+            return
+        h, w = img.shape[:2]
+        if (h, w) != (self.cam_h, self.cam_w):
+            QtWidgets.QMessageBox.warning(
+                self, "Resolution mismatch",
+                f"Expected {self.cam_w}×{self.cam_h}, got {w}×{h}. "
+                "Swap cancelled to preserve existing point coordinates."
+            )
+            return
+
+        # Accept swap (points retained because resolution matches)
+        self.cam_bgr = img
+        self.cam_path = path
+        # keep cam_pts/map_pts as-is; invalidate any inlier coloring until next solve
+        self.inlier_mask = None
+
+        self._update_status(f"Swapped camera image to: {path}")
+        self._draw_cam()
+
+
+    def _find_homography_compat(self, cam_arr, map_arr, thr_px=3.0):
+        """
+        Try USAC/MAGSAC if available, otherwise fall back to classic RANSAC.
+        Handles OpenCV builds that don't accept extra keyword args.
+        Returns (H, inlier_mask_bool) or (None, None).
+        """
+        # Prefer USAC_MAGSAC if present
+        method_codes = []
+        if hasattr(cv2, "USAC_MAGSAC"):
+            method_codes.append(cv2.USAC_MAGSAC)
+        if hasattr(cv2, "USAC_ACCURATE"):
+            method_codes.append(cv2.USAC_ACCURATE)
+        # Always include classic RANSAC as fallback
+        method_codes.append(cv2.RANSAC)
+
+        last_err = None
+        for m in method_codes:
+            try:
+                # Try the *modern* signature first (some builds accept keywords)
+                H, inliers = cv2.findHomography(
+                    cam_arr, map_arr,
+                    method=m,
+                    ransacReprojThreshold=float(thr_px)
+                )
+                if H is not None and inliers is not None:
+                    return H, inliers.ravel().astype(bool), m
+            except TypeError as e:
+                last_err = e
+                # Fall back to the older positional signature (max 4 args)
+                try:
+                    H, inliers = cv2.findHomography(cam_arr, map_arr, m, float(thr_px))
+                    if H is not None and inliers is not None:
+                        return H, inliers.ravel().astype(bool), m
+                except Exception as e2:
+                    last_err = e2
+            except Exception as e:
+                last_err = e
+                continue
+
+        # Nothing worked
+        print("[homography] failed:", last_err)
+        return None, None, None
+    
+
+    def _solve_robust_and_save(self):
+        n = min(len(self.cam_pts), len(self.map_pts))
         if n < 4:
-            print("Need at least 4 matched pairs.")
-            continue
-        cam_arr = np.array(cam_pts[:n], dtype=np.float32)
-        map_arr = np.array(map_pts[:n], dtype=np.float32)
-        H, inliers = cv2.findHomography(cam_arr, map_arr, cv2.RANSAC, 3.0)
-        if H is None:
-            print("Homography failed; try more / better-spread points.")
-            continue
+            QtWidgets.QMessageBox.warning(self, "Not enough points", "Need at least 4 matched pairs.")
+            return
+
+        cam_arr = np.asarray(self.cam_pts[:n], dtype=np.float64)
+        map_arr = np.asarray(self.map_pts[:n], dtype=np.float64)
+
+        # Robust estimate (USAC/MAGSAC if available, else classic RANSAC)
+        H0, inliers_bool, method_used = self._find_homography_compat(
+            cam_arr, map_arr, thr_px=RANSAC_THRESH
+        )
+        if H0 is None or inliers_bool is None or inliers_bool.sum() < 4:
+            QtWidgets.QMessageBox.warning(
+                self, "Homography failed",
+                "Robust estimation could not find a stable model. "
+                "Try more/better-spread *pavement* points."
+            )
+            return
+
+        # Optional LSQ refit on inliers for best accuracy
+        H, _ = cv2.findHomography(cam_arr[inliers_bool], map_arr[inliers_bool], 0)
+
+        # Residuals on inliers
+        errs_all = self._reproj_errors(H, cam_arr.astype(np.float32), map_arr.astype(np.float32))
+        inl = inliers_bool
+        rmse = float(np.sqrt(np.mean(errs_all[inl] ** 2)))
+        med  = float(np.median(errs_all[inl]))
+        p95  = float(np.percentile(errs_all[inl], 95))
+
+        # Save H
         np.save(H_OUT, H)
-        print(f"Saved H to {H_OUT}. Inliers {int(inliers.sum())}/{n}")
 
-        bev = cv2.warpPerspective(cam_bgr, H, (ortho_w, ortho_h), flags=cv2.INTER_LINEAR)
+        # Warp to full ortho canvas with constant borders
+        bev = cv2.warpPerspective(
+            self.cam_bgr, H, (self.ortho_w, self.ortho_h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0)
+        )
+
+        # Mask to convex hull of *inlier* destination points to avoid extrapolation
+        hull_pts = map_arr[inl].astype(np.float32)
+        if len(hull_pts) >= 3:
+            hull = cv2.convexHull(hull_pts).astype(np.int32)
+            mask = np.zeros((self.ortho_h, self.ortho_w), np.uint8)
+            cv2.fillConvexPoly(mask, hull, 255)
+            bev = cv2.bitwise_and(bev, bev, mask=mask)
+
+        # Save warp (use a distinct filename to not clobber LSQ result)
+        out_path = WARP_OUT.replace(".png", "_robust.png")
+        cv2.imwrite(out_path, bev)
+
+        # Persist points JSON
+        try:
+            pts_path = self._save_points()
+        except Exception as e:
+            pts_path = f"(save failed: {e})"
+
+        # Update UI state (color points by inlier/outlier)
+        self.inlier_mask = inliers_bool
+
+        # Method label
+        if method_used == getattr(cv2, "USAC_MAGSAC", -1):
+            method_name = "USAC_MAGSAC++"
+        elif method_used == getattr(cv2, "USAC_ACCURATE", -2):
+            method_name = "USAC_ACCURATE"
+        elif method_used == cv2.RANSAC:
+            method_name = "RANSAC"
+        else:
+            method_name = f"method={method_used}"
+
+        summary = (
+            f"<b>Method</b>: {method_name}  |  <b>thr</b>: {RANSAC_THRESH:.1f} px<br>"
+            f"<b>Pairs</b>: {n}  |  <b>Inliers</b>: {int(inl.sum())} ({100.0 * inl.mean():.1f}%)<br>"
+            f"<b>RMSE@inliers</b>: {rmse:.2f}px  |  <b>Median</b>: {med:.2f}px  |  <b>P95</b>: {p95:.2f}px<br>"
+            f"Saved H → <code>{H_OUT}</code><br>"
+            f"Saved warp → <code>{out_path}</code><br>"
+            f"Saved points → <code>{pts_path}</code>"
+        )
+        self.results_lbl.setText(summary)
+        self.results_box.setVisible(True)
+
+        self._update_status("Solved with robust homography (inliers highlighted).")
+        self.redraw_all()
+
+
+
+
+    # ---------- active pane ----------
+    def _set_active(self, pane_or_none):
+        if pane_or_none is None: return
+        self.active_pane = pane_or_none
+        self.cam_label.setStyleSheet(ACTIVE_BORDER if self.active_pane == 'cam' else INACTIVE_BORDER)
+        self.ortho_label.setStyleSheet(ACTIVE_BORDER if self.active_pane == 'ortho' else INACTIVE_BORDER)
+        self._update_status()
+
+    def _active_desc(self):
+        return "Camera (top)" if self.active_pane == 'cam' else "Ortho (bottom)"
+
+    def _update_status(self, extra: str = ""):
+        pairs = min(len(self.cam_pts), len(self.map_pts))
+        txt = (f"Active: {self._active_desc()} | "
+               f"Pairs: {pairs} | "
+               f"Cam zoom {self.cam_zoom:.2f} pan({self.cam_pan_x},{self.cam_pan_y}) | "
+               f"Ortho zoom {self.ortho_zoom:.2f} pan({self.ortho_pan_x},{self.ortho_pan_y})")
+        if extra: txt += "\n" + extra
+        self.status_lbl.setText(txt)
+
+    # ---------- drawing ----------
+    def redraw_all(self):
+        self._draw_cam()
+        self._draw_ortho()
+
+    def _draw_cam(self):
+        view_w = max(1, self.cam_label.width())
+        view_h = max(1, self.cam_label.height())
+        base_scale = min(view_w / self.cam_w, view_h / self.cam_h)
+        eff = base_scale * self.cam_zoom
+        big_w = max(1, int(round(self.cam_w * eff)))
+        big_h = max(1, int(round(self.cam_h * eff)))
+        self.cam_pan_x = clamp(self.cam_pan_x, 0, max(0, big_w - view_w))
+        self.cam_pan_y = clamp(self.cam_pan_y, 0, max(0, big_h - view_h))
+        big = cv2.resize(self.cam_bgr, (big_w, big_h), interpolation=cv2.INTER_LINEAR)
+        view = big[self.cam_pan_y:self.cam_pan_y+view_h, self.cam_pan_x:self.cam_pan_x+view_w].copy()
+
+        # draw points (color by inlier mask if available)
+        for i, (x, y) in enumerate(self.cam_pts, 1):
+            xd = int(round(x * eff)) - self.cam_pan_x
+            yd = int(round(y * eff)) - self.cam_pan_y
+            if 0 <= xd < view_w and 0 <= yd < view_h:
+                color = (0,255,0)  # default green
+                if self.inlier_mask is not None and i-1 < len(self.inlier_mask):
+                    color = (0,200,255) if self.inlier_mask[i-1] else (0,0,255)  # same scheme as bottom
+                cv2.circle(view, (xd, yd), 5, color, -1)
+                cv2.putText(view, str(i), (xd+6, yd-6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1, cv2.LINE_AA)
+        self.cam_label.setPixmap(QtGui.QPixmap.fromImage(cv_bgr_to_qimage(view)))
+
+    def _draw_ortho(self):
+        view_w = max(1, self.ortho_label.width())
+        view_h = max(1, self.ortho_label.height())
+        base_scale = min(view_w / self.ortho_w, view_h / self.ortho_h)
+        eff = base_scale * self.ortho_zoom
+        big_w = max(1, int(round(self.ortho_w * eff)))
+        big_h = max(1, int(round(self.ortho_h * eff)))
+        self.ortho_pan_x = clamp(self.ortho_pan_x, 0, max(0, big_w - view_w))
+        self.ortho_pan_y = clamp(self.ortho_pan_y, 0, max(0, big_h - view_h))
+
+        rel_scale = eff / self.prev_scale
+        bw = max(1, int(round(self.prev_w * rel_scale)))
+        bh = max(1, int(round(self.prev_h * rel_scale)))
+        big = cv2.resize(self.ortho_bgr_base, (bw, bh), interpolation=cv2.INTER_LINEAR)
+        if big.shape[1] < view_w or big.shape[0] < view_h:
+            pad_w = max(0, view_w - big.shape[1]); pad_h = max(0, view_h - big.shape[0])
+            big = cv2.copyMakeBorder(big, 0, pad_h, 0, pad_w, cv2.BORDER_CONSTANT, value=(0,0,0))
+        view = big[self.ortho_pan_y:self.ortho_pan_y+view_h,
+                   self.ortho_pan_x:self.ortho_pan_x+view_w].copy()
+
+        # draw points (inlier=orange/yellow, outlier=red)
+        for i, (x, y) in enumerate(self.map_pts, 1):
+            xd = int(round(x * eff)) - self.ortho_pan_x
+            yd = int(round(y * eff)) - self.ortho_pan_y
+            if 0 <= xd < view_w and 0 <= yd < view_h:
+                color = (0,200,255)
+                if self.inlier_mask is not None and i-1 < len(self.inlier_mask):
+                    color = (0,200,255) if self.inlier_mask[i-1] else (0,0,255)
+                cv2.circle(view, (xd, yd), 5, color, -1)
+                cv2.putText(view, str(i), (xd+6, yd-6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1, cv2.LINE_AA)
+        self.ortho_label.setPixmap(QtGui.QPixmap.fromImage(cv_bgr_to_qimage(view)))
+
+    # ---------- clicks ----------
+    def _on_cam_click(self, x, y):
+        view_w = max(1, self.cam_label.width())
+        view_h = max(1, self.cam_label.height())
+        base_scale = min(view_w / self.cam_w, view_h / self.cam_h)
+        eff = base_scale * self.cam_zoom
+        x_px = int(round((self.cam_pan_x + x) / eff))
+        y_px = int(round((self.cam_pan_y + y) / eff))
+        x_px = clamp(x_px, 0, self.cam_w - 1)
+        y_px = clamp(y_px, 0, self.cam_h - 1)
+        self.cam_pts.append([x_px, y_px])
+        self.inlier_mask = None
+        self._update_status(); self._draw_cam()
+
+    def _on_ortho_click(self, x, y):
+        view_w = max(1, self.ortho_label.width())
+        view_h = max(1, self.ortho_label.height())
+        base_scale = min(view_w / self.ortho_w, view_h / self.ortho_h)
+        eff = base_scale * self.ortho_zoom
+        x_px = int(round((self.ortho_pan_x + x) / eff))
+        y_px = int(round((self.ortho_pan_y + y) / eff))
+        x_px = clamp(x_px, 0, self.ortho_w - 1)
+        y_px = clamp(y_px, 0, self.ortho_h - 1)
+        self.map_pts.append([x_px, y_px])
+        self.inlier_mask = None
+        self._update_status(); self._draw_ortho()
+
+    # ---------- pan/zoom targeting the hovered pane ----------
+    def _zoom_active(self, factor):
+        if self.active_pane == 'cam': self._zoom_cam(factor)
+        else:                          self._zoom_ortho(factor)
+    def _pan_active(self, dx, dy):
+        if self.active_pane == 'cam': self._pan_cam(dx, dy)
+        else:                          self._pan_ortho(dx, dy)
+
+    # Camera pan/zoom
+    def _zoom_cam(self, factor):
+        view_w = max(1, self.cam_label.width())
+        view_h = max(1, self.cam_label.height())
+        base_scale = min(view_w / self.cam_w, view_h / self.cam_h)
+        old_eff = base_scale * self.cam_zoom
+        self.cam_zoom = clamp(self.cam_zoom * factor, 0.25, 16.0)
+        new_eff = base_scale * self.cam_zoom
+        cx = self.cam_pan_x + view_w // 2; cy = self.cam_pan_y + view_h // 2
+        cx_px = cx / old_eff; cy_px = cy / old_eff
+        self.cam_pan_x = int(round(cx_px * new_eff)) - view_w // 2
+        self.cam_pan_y = int(round(cy_px * new_eff)) - view_h // 2
+        self._update_status(); self._draw_cam()
+
+    def _pan_cam(self, dx, dy):
+        step = max(5, int(50 / max(self.cam_zoom, 1e-6)))
+        self.cam_pan_x += dx * step; self.cam_pan_y += dy * step
+        self._update_status(); self._draw_cam()
+
+    # Ortho pan/zoom
+    def _zoom_ortho(self, factor):
+        view_w = max(1, self.ortho_label.width())
+        view_h = max(1, self.ortho_label.height())
+        base_scale = min(view_w / self.ortho_w, view_h / self.ortho_h)
+        old_eff = base_scale * self.ortho_zoom
+        self.ortho_zoom = clamp(self.ortho_zoom * factor, 0.25, 16.0)
+        new_eff = base_scale * self.ortho_zoom
+        cx = self.ortho_pan_x + view_w // 2; cy = self.ortho_pan_y + view_h // 2
+        cx_px = cx / old_eff; cy_px = cy / old_eff
+        self.ortho_pan_x = int(round(cx_px * new_eff)) - view_w // 2
+        self.ortho_pan_y = int(round(cy_px * new_eff)) - view_h // 2
+        self._update_status(); self._draw_ortho()
+
+    def _pan_ortho(self, dx, dy):
+        step = max(5, int(50 / max(self.ortho_zoom, 1e-6)))
+        self.ortho_pan_x += dx * step; self.ortho_pan_y += dy * step
+        self._update_status(); self._draw_ortho()
+
+    # ---------- points I/O ----------
+    def _save_points(self):
+        data = {
+            "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "camera": self.cam_path,          # <- use current path
+            "ortho": ORTHO_PATH,
+            "cam_pts": self.cam_pts,
+            "map_pts": self.map_pts,
+        }
+        with open(PTS_OUT, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        return PTS_OUT
+
+    def _load_points_dialog(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load points JSON", ".", "JSON (*.json)")
+        if not path: return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            cam = data.get("cam_pts") or []
+            mpp = data.get("map_pts") or []
+            if len(cam) != len(mpp) or len(cam) < 1:
+                raise ValueError("Invalid or empty point arrays.")
+            self.cam_pts = [list(map(int, p)) for p in cam]
+            self.map_pts = [list(map(int, p)) for p in mpp]
+            self.inlier_mask = None
+            self._update_status(f"Loaded {len(self.cam_pts)} pairs from {path}")
+            self.redraw_all()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Load failed", str(e))
+
+    # ---------- undo / solve ----------
+    def _undo(self):
+        if len(self.cam_pts) > len(self.map_pts): self.cam_pts.pop()
+        elif len(self.map_pts) > len(self.cam_pts): self.map_pts.pop()
+        elif self.cam_pts:
+            self.cam_pts.pop(); self.map_pts.pop()
+        self.inlier_mask = None
+        self._update_status(); self.redraw_all()
+
+    def _solve_and_save(self):
+        n = min(len(self.cam_pts), len(self.map_pts))
+        if n < 4:
+            QtWidgets.QMessageBox.warning(self, "Not enough points", "Need at least 4 matched pairs.")
+            return
+
+        cam_arr = np.array(self.cam_pts[:n], np.float64)
+        map_arr = np.array(self.map_pts[:n], np.float64)
+
+        # Plain DLT homography: use ALL points (no RANSAC, no outliers)
+        H, _ = cv2.findHomography(cam_arr, map_arr, 0)
+        if H is None:
+            QtWidgets.QMessageBox.warning(self, "Homography failed", "Numerical issue; try adding/redistributing points.")
+            return
+
+        # Everyone is an "inlier" now
+        self.inlier_mask = np.ones(n, dtype=bool)
+
+        # Residual stats (so you can still judge fit quality)
+        errs = self._reproj_errors(H, cam_arr.astype(np.float32), map_arr.astype(np.float32))
+        rmse = float(np.sqrt(np.mean(errs**2)))
+        med  = float(np.median(errs))
+        p95  = float(np.percentile(errs, 95))
+
+        # Save outputs
+        np.save(H_OUT, H)
+        bev = cv2.warpPerspective(
+            self.cam_bgr, H, (self.ortho_w, self.ortho_h),
+            flags=cv2.INTER_LINEAR
+        )
         cv2.imwrite(WARP_OUT, bev)
-        print(f"Wrote {WARP_OUT}")
-        overlay = cv2.addWeighted(cv2.cvtColor(ortho_rgb, cv2.COLOR_RGB2BGR), 0.6, bev, 0.4, 0)
-        cv2.imshow("Warp preview (overlay)", overlay)
 
-cv2.destroyAllWindows()
+        # Save points (use your helper; preserve points even if solve already done)
+        try:
+            pts_path = self._save_points()
+        except Exception as e:
+            pts_path = f"(save failed: {e})"
+
+        summary = (f"<b>Method</b>: LSQ Homography (no RANSAC)<br>"
+                f"<b>Pairs</b>: {n}<br>"
+                f"<b>RMSE</b>: {rmse:.2f}px  |  <b>Median</b>: {med:.2f}px  |  <b>P95</b>: {p95:.2f}px<br>"
+                f"Saved H → <code>{H_OUT}</code><br>"
+                f"Saved warp → <code>{WARP_OUT}</code><br>"
+                f"Saved points → <code>{pts_path}</code>")
+        self.results_lbl.setText(summary)
+        self.results_box.setVisible(True)
+
+        self._update_status("Solved with all points (no rejections).")
+        self.redraw_all()
+
+
+    def _solve_piecewise_and_save(self):
+        """Piecewise-affine (exact-through-points) with convex-hull masking (no .mesh needed)."""
+        try:
+            from skimage.transform import PiecewiseAffineTransform, warp
+        except Exception:
+            QtWidgets.QMessageBox.critical(self, "Missing dependency",
+                "scikit-image is required:\n  pip install scikit-image")
+            return
+
+        n = min(len(self.cam_pts), len(self.map_pts))
+        if n < 3:
+            QtWidgets.QMessageBox.warning(self, "Not enough points",
+                                        "Need at least 3 non-collinear pairs.")
+            return
+
+        # Points are (x, y) already; scikit-image expects (x, y) as well.
+        src = np.asarray(self.cam_pts[:n], dtype=np.float64)  # camera points
+        dst = np.asarray(self.map_pts[:n], dtype=np.float64)  # ortho/map points
+
+        # Guard against duplicates / degeneracy
+        if np.unique(dst.round(3), axis=0).shape[0] < 3:
+            QtWidgets.QMessageBox.warning(self, "Bad points",
+                "Destination points contain duplicates/collinearity; add more spread points.")
+            return
+
+        tform = PiecewiseAffineTransform()
+        if not tform.estimate(src, dst):
+            QtWidgets.QMessageBox.warning(self, "Solve failed",
+                                        "Triangulation failed; add/redistribute points (avoid collinear sets).")
+            return
+
+        # Warp with constant fill (avoid edge streaks)
+        img_rgb = cv2.cvtColor(self.cam_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        out = warp(
+            img_rgb,
+            tform,                                    # correct direction: cam -> map
+            output_shape=(self.ortho_h, self.ortho_w),
+            order=1, mode="constant", cval=0.0, preserve_range=True
+        )
+        out_bgr = cv2.cvtColor((out * 255.0).astype(np.uint8), cv2.COLOR_RGB2BGR)
+
+        # ---- Mask to convex hull of destination points (eliminate extrapolated wedges) ----
+        hull = cv2.convexHull(dst.astype(np.float32)).astype(np.int32)  # shape (k,1,2) or (k,2)
+        hull = hull.reshape(-1, 2)
+        mask = np.zeros((self.ortho_h, self.ortho_w), np.uint8)
+        if len(hull) >= 3:
+            cv2.fillConvexPoly(mask, hull, 255)
+            out_bgr = cv2.bitwise_and(out_bgr, out_bgr, mask=mask)
+
+            # Optional: crop to mask bbox
+            ys, xs = np.where(mask > 0)
+            if ys.size and xs.size:
+                y0, y1 = ys.min(), ys.max() + 1
+                x0, x1 = xs.min(), xs.max() + 1
+                out_bgr = out_bgr[y0:y1, x0:x1]
+
+        # Treat all as "inliers" (no rejection)
+        self.inlier_mask = np.ones(n, dtype=bool)
+
+        # Report exact interpolation error at control points (should be ~0)
+        pred = tform(src)
+        errs = np.linalg.norm(pred - dst, axis=1)
+        rmse = float(np.sqrt(np.mean(errs**2)))
+        med  = float(np.median(errs))
+        p95  = float(np.percentile(errs, 95))
+
+        out_path = WARP_OUT.replace(".png", "_pwa.png")
+        cv2.imwrite(out_path, out_bgr)
+
+        summary = (f"<b>Method</b>: Piecewise Affine (exact), convex-hull masked<br>"
+                f"<b>Pairs</b>: {n}<br>"
+                f"<b>RMSE@ctrl</b>: {rmse:.3f}px  |  <b>Median</b>: {med:.3f}px  |  <b>P95</b>: {p95:.3f}px<br>"
+                f"Saved warp → <code>{out_path}</code>")
+        self.results_lbl.setText(summary)
+        self.results_box.setVisible(True)
+        self._update_status("Solved with piecewise affine (no rejections), convex-hull masked.")
+        self.redraw_all()
+
+
+    @staticmethod
+    def _reproj_errors(H, src_pts, dst_pts):
+        src_h = np.hstack([src_pts, np.ones((len(src_pts), 1), np.float32)])
+        proj = (H @ src_h.T).T
+        proj = proj[:, :2] / proj[:, 2:3]
+        return np.linalg.norm(proj - dst_pts, axis=1)
+
+# ---------- main ----------
+def main():
+    app = QtWidgets.QApplication(sys.argv)
+    w = PairPointsGUI()
+    w.show()
+    sys.exit(app.exec())
+
+if __name__ == "__main__":
+    main()
