@@ -85,7 +85,7 @@ class ClickLabel(QtWidgets.QLabel):
 class PairPointsGUI(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Pair points — robust + save/load + stats")
+        self.setWindowTitle("RoadPairer")
         self.resize(1400, 900)
 
         # ---- load camera ----
@@ -193,9 +193,9 @@ class PairPointsGUI(QtWidgets.QWidget):
         al = QtWidgets.QVBoxLayout(act_box)
         self.btn_load = QtWidgets.QPushButton("Load Points…")
         self.btn_undo  = QtWidgets.QPushButton("Undo last point (U)")
-        self.btn_solve = QtWidgets.QPushButton("Solve & Save (S)")
+        self.btn_solve = QtWidgets.QPushButton("Solve (least-squares)")
         self.btn_solve_pwa = QtWidgets.QPushButton("Solve (piecewise, exact)")
-        self.btn_solve_robust = QtWidgets.QPushButton("Solve (robust, RANSAC/USAC)")
+        self.btn_solve_robust = QtWidgets.QPushButton("Solve (robust, MAGSAC++)")
 
         self.btn_swap_cam = QtWidgets.QPushButton("Swap Camera Image…")
 
@@ -224,6 +224,20 @@ class PairPointsGUI(QtWidgets.QWidget):
         self.results_box.setVisible(False)
         right.addWidget(self.results_box)
 
+                # Estimator note
+        note_box = QtWidgets.QGroupBox("Estimator note")
+        nl = QtWidgets.QVBoxLayout(note_box)
+        self.magsac_note_lbl = QtWidgets.QLabel(
+            "For our intents and purposes, <b>MAGSAC++</b> (USAC) tends to be the most "
+            "accurate overall on planar pavement when points are well-spread and mostly on road. "
+            "This app prefers USAC/MAGSAC++ automatically and falls back to USAC_ACCURATE or "
+            "classic RANSAC if unavailable."
+        )
+        self.magsac_note_lbl.setWordWrap(True)
+        nl.addWidget(self.magsac_note_lbl)
+        right.addWidget(note_box)
+
+
         # Help
         help_box = QtWidgets.QGroupBox("Shortcuts")
         hl = QtWidgets.QVBoxLayout(help_box)
@@ -231,7 +245,7 @@ class PairPointsGUI(QtWidgets.QWidget):
             "Hover decides target pane (highlighted).\n"
             "Zoom: +/= in, - out.  Pan: arrows or WASD.\n"
             "Click top (CAM) then bottom (ORTHO) to pair.\n"
-            "U undo, S solve/save, Q quit."
+            "U undo, Q quit."
         ))
         right.addWidget(help_box)
         right.addStretch(1)
@@ -297,7 +311,7 @@ class PairPointsGUI(QtWidgets.QWidget):
             ("Down", 0, 1), ("S", 0, 1),
         ]: sc_pan(ks, dx, dy)
         sc("U", self._undo)
-        sc("S", self._solve_and_save)
+        # sc("S", self._solve_and_save)
 
     # ---- event filter: redraw on window resize ----
     def eventFilter(self, obj, ev):
