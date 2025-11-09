@@ -1,0 +1,5 @@
+CH_HOST=example.com
+CH_PORT=8123
+CH_USER=default
+CH_PASSWORD=defaultpw
+CH_DB=trajectories

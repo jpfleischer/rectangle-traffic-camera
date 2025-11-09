@@ -6,6 +6,7 @@
 #  - Result panel with inlier stats (count, %, RMSE, median, P95, method, thr)
 #  - Camera pane colored by inlier/outlier after solve (like ortho)
 
+
 import sys, json, time
 import numpy as np
 import cv2
@@ -22,7 +23,7 @@ PTS_OUT    = "pairs_cam_to_map.json"   # <-- points saved/loaded here
 
 # ---- robust estimator settings ----
 H_METHOD = getattr(cv2, "USAC_MAGSAC", cv2.RANSAC)  # prefer MAGSAC++
-RANSAC_THRESH   = 10.0   # reprojection threshold in *ortho pixels* (tune 2–4)
+RANSAC_THRESH   = 10.0   # reprojection threshold in *ortho pixels*
 MAX_ITERS       = 10000
 CONFIDENCE      = 0.999
 REFINE_ITERS    = 10
@@ -30,7 +31,7 @@ REFINE_ITERS    = 10
 ACTIVE_BORDER   = "QLabel { border: 2px solid #4da3ff; }"
 INACTIVE_BORDER = "QLabel { border: 1px solid #555; }"
 
-# ---------- utilities ----------
+
 def to_8bit_rgb(arr, nodata=None):
     if arr.ndim == 2:
         arr = np.stack([arr, arr, arr], axis=2)
@@ -42,49 +43,66 @@ def to_8bit_rgb(arr, nodata=None):
     mask = None
     if nodata is not None:
         mask = np.any(arr == nodata, axis=2)
+
     def pct(ch):
         if mask is not None:
             vals = ch[~mask]
-            if vals.size == 0: return 0.0, 1.0
+            if vals.size == 0:
+                return 0.0, 1.0
             lo, hi = np.percentile(vals, (1, 99))
         else:
             lo, hi = np.percentile(ch, (1, 99))
-        if hi <= lo: hi = lo + 1.0
+        if hi <= lo:
+            hi = lo + 1.0
         return lo, hi
+
     for c in range(o.shape[2]):
         lo, hi = pct(o[..., c])
         o[..., c] = np.clip((o[..., c] - lo) / (hi - lo) * 255.0, 0, 255)
     return o.astype(np.uint8, copy=False)
+
 
 def cv_bgr_to_qimage(bgr: np.ndarray) -> QtGui.QImage:
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     h, w, ch = rgb.shape
     return QtGui.QImage(rgb.data, w, h, ch * w, QtGui.QImage.Format_RGB888).copy()
 
-def clamp(v, lo, hi): return max(lo, min(hi, v))
 
-# ---------- clickable / hoverable label ----------
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
 class ClickLabel(QtWidgets.QLabel):
     clicked = QtCore.Signal(int, int)   # x, y in widget coords
     hovered = QtCore.Signal(bool)       # True on enter, False on leave
+
     def __init__(self, *a, **k):
         super().__init__(*a, **k)
         self.setMouseTracking(True)
         self.setMinimumSize(150, 120)
+
     def mousePressEvent(self, e: QtGui.QMouseEvent) -> None:
         if e.button() == QtCore.Qt.LeftButton:
             pos = e.position() if hasattr(e, "position") else e.localPos()
             self.clicked.emit(int(pos.x()), int(pos.y()))
         super().mousePressEvent(e)
-    def enterEvent(self, e: QtCore.QEvent) -> None:
-        self.hovered.emit(True);  super().enterEvent(e)
-    def leaveEvent(self, e: QtCore.QEvent) -> None:
-        self.hovered.emit(False); super().leaveEvent(e)
 
-# ---------- main widget ----------
-class PairPointsGUI(QtWidgets.QWidget):
-    def __init__(self):
-        super().__init__()
+    def enterEvent(self, e: QtCore.QEvent) -> None:
+        self.hovered.emit(True)
+        super().enterEvent(e)
+
+    def leaveEvent(self, e: QtCore.QEvent) -> None:
+        self.hovered.emit(False)
+        super().leaveEvent(e)
+
+
+class PairingTab(QtWidgets.QWidget):
+    """
+    This is your old PairPointsGUI, refactored into a QWidget so it can be used
+    as a tab inside the main app.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
         self.setWindowTitle("RoadPairer")
         self.resize(1400, 900)
 
@@ -95,36 +113,34 @@ class PairPointsGUI(QtWidgets.QWidget):
         self.cam_bgr = cam_bgr
         self.cam_h, self.cam_w = cam_bgr.shape[:2]
 
-        # ---- load ortho (preview for display; keep full size meta) ----
+        # ---- load ortho preview ----
         with rio.open(ORTHO_PATH) as src:
             self.ortho_w, self.ortho_h = src.width, src.height
             nodata = src.nodata
             bands = [1, 2, 3] if src.count >= 3 else [1]
             self.prev_w = min(3000, self.ortho_w)
             self.prev_h = max(1, int(round(self.ortho_h * (self.prev_w / self.ortho_w))))
-            prev = src.read(bands, out_shape=(len(bands), self.prev_h, self.prev_w),
-                            resampling=Resampling.bilinear)
+            prev = src.read(
+                bands,
+                out_shape=(len(bands), self.prev_h, self.prev_w),
+                resampling=Resampling.bilinear,
+            )
             prev = np.moveaxis(prev, 0, 2)  # HWC
             o8 = to_8bit_rgb(prev, nodata=nodata)
             self.ortho_bgr_base = cv2.cvtColor(o8, cv2.COLOR_RGB2BGR)
-            self.prev_scale = self.prev_w / float(self.ortho_w)  # original->preview scale
+            self.prev_scale = self.prev_w / float(self.ortho_w)
 
         # ---- pairing/interaction state ----
         self.cam_pts, self.map_pts = [], []
         self.inlier_mask = None
-        # per-pane zoom/pan
         self.cam_zoom, self.cam_pan_x, self.cam_pan_y = 1.0, 0, 0
         self.ortho_zoom, self.ortho_pan_x, self.ortho_pan_y = 2.0, 0, 0
-        self.active_pane = 'ortho'  # 'cam' or 'ortho'
+        self.active_pane = "ortho"
         self._shortcuts = []
+        self.cam_path = CAM_PATH
 
-        self.cam_path = CAM_PATH  # track current camera image path for saving metadata
-
-
-        # ---- build UI ----
         self._build_ui()
         self._connect_signals()
-        # Coalesced redraw timer (prevents eventFilter storms during resize)
         self._redraw_timer = QtCore.QTimer(self)
         self._redraw_timer.setSingleShot(True)
         self._redraw_timer.timeout.connect(self.redraw_all)
@@ -132,86 +148,86 @@ class PairPointsGUI(QtWidgets.QWidget):
         self._update_status()
         self.redraw_all()
 
-    # ---------- UI ----------
+
     def _build_ui(self):
         root = QtWidgets.QHBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(8)
 
-        # Left: vertical splitter (camera over ortho)
         self.vsplit = QtWidgets.QSplitter(QtCore.Qt.Vertical)
         self.vsplit.setChildrenCollapsible(False)
 
         self.cam_label = ClickLabel()
         self.cam_label.setStyleSheet(INACTIVE_BORDER)
-        self.cam_label.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        self.cam_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding
+        )
 
         self.ortho_label = ClickLabel()
         self.ortho_label.setStyleSheet(ACTIVE_BORDER)
-        self.ortho_label.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        self.ortho_label.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding
+        )
 
         self.vsplit.addWidget(self.cam_label)
         self.vsplit.addWidget(self.ortho_label)
         self.vsplit.setStretchFactor(0, 2)
         self.vsplit.setStretchFactor(1, 3)
 
-        # Right panel (fixed-ish)
         self.right_panel = QtWidgets.QWidget()
         self.right_panel.setMinimumWidth(340)
         self.right_panel.setMaximumWidth(700)
-        self.right_panel.setSizePolicy(QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Expanding)
+        self.right_panel.setSizePolicy(
+            QtWidgets.QSizePolicy.Fixed, QtWidgets.QSizePolicy.Expanding
+        )
 
         right = QtWidgets.QVBoxLayout(self.right_panel)
         right.setContentsMargins(0, 0, 0, 0)
         right.setSpacing(10)
         right.addWidget(QtWidgets.QLabel("<b>Controls</b>"))
 
-        # Zoom group
+        # Zoom
         zoom_box = QtWidgets.QGroupBox("Zoom (pane under mouse)")
         zl = QtWidgets.QGridLayout(zoom_box)
-        self.btn_zoom_in  = QtWidgets.QPushButton("Zoom In  (+/=)")
+        self.btn_zoom_in = QtWidgets.QPushButton("Zoom In  (+/=)")
         self.btn_zoom_out = QtWidgets.QPushButton("Zoom Out (-)")
-        zl.addWidget(self.btn_zoom_in,  0, 0)
+        zl.addWidget(self.btn_zoom_in, 0, 0)
         zl.addWidget(self.btn_zoom_out, 0, 1)
         right.addWidget(zoom_box)
 
-        # Pan group
+        # Pan
         pan_box = QtWidgets.QGroupBox("Pan (pane under mouse)")
         pl = QtWidgets.QGridLayout(pan_box)
-        self.btn_pan_up    = QtWidgets.QPushButton("Up    (W/↑)")
-        self.btn_pan_left  = QtWidgets.QPushButton("Left  (A/←)")
+        self.btn_pan_up = QtWidgets.QPushButton("Up    (W/↑)")
+        self.btn_pan_left = QtWidgets.QPushButton("Left  (A/←)")
         self.btn_pan_right = QtWidgets.QPushButton("Right (D/→)")
-        self.btn_pan_down  = QtWidgets.QPushButton("Down  (S/↓)")
-        pl.addWidget(self.btn_pan_up,    0, 1)
-        pl.addWidget(self.btn_pan_left,  1, 0)
+        self.btn_pan_down = QtWidgets.QPushButton("Down  (S/↓)")
+        pl.addWidget(self.btn_pan_up, 0, 1)
+        pl.addWidget(self.btn_pan_left, 1, 0)
         pl.addWidget(self.btn_pan_right, 1, 2)
-        pl.addWidget(self.btn_pan_down,  2, 1)
+        pl.addWidget(self.btn_pan_down, 2, 1)
         right.addWidget(pan_box)
 
         # Actions
         act_box = QtWidgets.QGroupBox("Actions")
         al = QtWidgets.QVBoxLayout(act_box)
         self.btn_load = QtWidgets.QPushButton("Load Points…")
-        self.btn_undo  = QtWidgets.QPushButton("Undo last point (U)")
+        self.btn_undo = QtWidgets.QPushButton("Undo last point (U)")
         self.btn_solve = QtWidgets.QPushButton("Solve (least-squares)")
         self.btn_solve_pwa = QtWidgets.QPushButton("Solve (piecewise, exact)")
         self.btn_solve_robust = QtWidgets.QPushButton("Solve (robust, MAGSAC++)")
-
         self.btn_swap_cam = QtWidgets.QPushButton("Swap Camera Image…")
-
-        self.btn_quit  = QtWidgets.QPushButton("Quit (Q)")
+        self.btn_quit = QtWidgets.QPushButton("Quit (Q)")
 
         al.addWidget(self.btn_load)
         al.addWidget(self.btn_undo)
         al.addWidget(self.btn_solve)
         al.addWidget(self.btn_solve_pwa)
         al.addWidget(self.btn_solve_robust)
-
         al.addWidget(self.btn_swap_cam)
         al.addWidget(self.btn_quit)
         right.addWidget(act_box)
 
-        # Status + results
         self.status_lbl = QtWidgets.QLabel()
         self.status_lbl.setWordWrap(True)
         right.addWidget(self.status_lbl)
@@ -224,7 +240,6 @@ class PairPointsGUI(QtWidgets.QWidget):
         self.results_box.setVisible(False)
         right.addWidget(self.results_box)
 
-                # Estimator note
         note_box = QtWidgets.QGroupBox("Estimator note")
         nl = QtWidgets.QVBoxLayout(note_box)
         self.magsac_note_lbl = QtWidgets.QLabel(
@@ -237,20 +252,19 @@ class PairPointsGUI(QtWidgets.QWidget):
         nl.addWidget(self.magsac_note_lbl)
         right.addWidget(note_box)
 
-
-        # Help
         help_box = QtWidgets.QGroupBox("Shortcuts")
         hl = QtWidgets.QVBoxLayout(help_box)
-        hl.addWidget(QtWidgets.QLabel(
-            "Hover decides target pane (highlighted).\n"
-            "Zoom: +/= in, - out.  Pan: arrows or WASD.\n"
-            "Click top (CAM) then bottom (ORTHO) to pair.\n"
-            "U undo, Q quit."
-        ))
+        hl.addWidget(
+            QtWidgets.QLabel(
+                "Hover decides target pane (highlighted).\n"
+                "Zoom: +/= in, - out.  Pan: arrows or WASD.\n"
+                "Click top (CAM) then bottom (ORTHO) to pair.\n"
+                "U undo, Q quit."
+            )
+        )
         right.addWidget(help_box)
         right.addStretch(1)
 
-        # Horizontal splitter
         self.hsplit = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
         self.hsplit.setChildrenCollapsible(False)
         self.hsplit.addWidget(self.vsplit)
@@ -260,6 +274,8 @@ class PairPointsGUI(QtWidgets.QWidget):
         self.hsplit.setSizes([1000, 360])
 
         root.addWidget(self.hsplit)
+
+
 
     def _connect_signals(self):
         # Hover selects active
@@ -817,12 +833,3 @@ class PairPointsGUI(QtWidgets.QWidget):
         proj = proj[:, :2] / proj[:, 2:3]
         return np.linalg.norm(proj - dst_pts, axis=1)
 
-# ---------- main ----------
-def main():
-    app = QtWidgets.QApplication(sys.argv)
-    w = PairPointsGUI()
-    w.show()
-    sys.exit(app.exec())
-
-if __name__ == "__main__":
-    main()
