@@ -118,8 +118,15 @@ class ClickHouseHTTP:
             auth=self._auth,
             timeout=timeout or max(self.timeout, 10),
         )
-        r.raise_for_status()
+
+        # >>> replace r.raise_for_status() with this:
+        if r.status_code != 200:
+            # include up to a few hundred chars of the ClickHouse error text
+            msg = r.text.strip().replace("\n", " ")[:500]
+            raise RuntimeError(f"ClickHouse HTTP {r.status_code}: {msg}")
+
         return r
+
 
     # ------------------------------------------------------------------
 

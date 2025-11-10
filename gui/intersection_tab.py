@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-# intersection_tab.py – "Intersection Geometry" tab
+# intersection_tab.py – "Intersection Geometry" tab (stop bar + divider line)
 
 import os
 import json
-import math
 
 import numpy as np
 import cv2
@@ -77,8 +76,11 @@ class ClickLabel(QtWidgets.QLabel):
 
 class IntersectionGeometryTab(QtWidgets.QWidget):
     """
-    Tab for defining per-intersection geometry (stop bar, lane direction) on the ortho,
-    and saving/loading it from ClickHouse.
+    Tab for defining per-intersection geometry on the ortho:
+      - stop bar (short line across lanes)
+      - divider line (line that separates “toward camera” vs “away” side)
+
+    Both are stored in ClickHouse (pixels + map meters).
     """
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -110,15 +112,15 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
         self.ortho_pan_y = 0
 
         # geometry state (in pixel coords)
-        self.stopbar_pts_px = []   # list of two [x, y]
-        self.dir_pts_px = []       # list of two [x, y]
+        self.stopbar_pts_px = []    # list of two [x, y]
+        self.divider_pts_px = []    # list of two [x, y]
 
-        # current mode: "idle", "draw_stopbar", "draw_dir"
+        # current mode: "idle", "draw_stopbar", "draw_divider"
         self.mode = "idle"
 
         self._shortcuts = []
 
-        # ClickHouse client (reuse env-based config)
+        # ClickHouse client (env-based config)
         ch_host = os.getenv("CH_HOST", "example.com")
         ch_port = int(os.getenv("CH_PORT", "8123"))
         ch_user = os.getenv("CH_USER", "default")
@@ -179,10 +181,10 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
         btn_box = QtWidgets.QGroupBox("Geometry editing")
         bl = QtWidgets.QVBoxLayout(btn_box)
         self.btn_draw_stopbar = QtWidgets.QPushButton("Draw Stop Bar (2 clicks)")
-        self.btn_draw_dir = QtWidgets.QPushButton("Draw Direction Arrow (2 clicks)")
+        self.btn_draw_divider = QtWidgets.QPushButton("Draw Divider Line (2 clicks)")
         self.btn_clear = QtWidgets.QPushButton("Clear Current Geometry")
         bl.addWidget(self.btn_draw_stopbar)
-        bl.addWidget(self.btn_draw_dir)
+        bl.addWidget(self.btn_draw_divider)
         bl.addWidget(self.btn_clear)
         rp.addWidget(btn_box)
 
@@ -227,7 +229,7 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
         self.ortho_label.clicked.connect(self._on_ortho_click)
 
         self.btn_draw_stopbar.clicked.connect(self._start_draw_stopbar)
-        self.btn_draw_dir.clicked.connect(self._start_draw_dir)
+        self.btn_draw_divider.clicked.connect(self._start_draw_divider)
         self.btn_clear.clicked.connect(self._clear_geometry)
 
         self.btn_zoom_in.clicked.connect(lambda: self._zoom_ortho(1.25))
@@ -257,7 +259,6 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
         _make_shortcut("Up", 0, -1)
         _make_shortcut("S", 0, 1)
         _make_shortcut("Down", 0, 1)
-
 
         self.installEventFilter(self)
 
@@ -302,8 +303,7 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
             self.ortho_pan_x : self.ortho_pan_x + view_w,
         ].copy()
 
-        # draw stopbar + direction
-        def draw_line(px_pts, color, arrow=False):
+        def draw_line(px_pts, color):
             if len(px_pts) != 2:
                 return
             (x1, y1), (x2, y2) = px_pts
@@ -311,15 +311,12 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
             y1d = int(round(y1 * eff)) - self.ortho_pan_y
             x2d = int(round(x2 * eff)) - self.ortho_pan_x
             y2d = int(round(y2 * eff)) - self.ortho_pan_y
-            if arrow:
-                cv2.arrowedLine(view, (x1d, y1d), (x2d, y2d), color, 2, tipLength=0.1)
-            else:
-                cv2.line(view, (x1d, y1d), (x2d, y2d), color, 2)
+            cv2.line(view, (x1d, y1d), (x2d, y2d), color, 2)
 
         # stop bar = yellow
-        draw_line(self.stopbar_pts_px, (0, 255, 255), arrow=False)
-        # direction = magenta arrow
-        draw_line(self.dir_pts_px, (255, 0, 255), arrow=True)
+        draw_line(self.stopbar_pts_px, (0, 255, 255))
+        # divider = cyan
+        draw_line(self.divider_pts_px, (255, 255, 0))
 
         self.ortho_label.setPixmap(
             QtGui.QPixmap.fromImage(cv_bgr_to_qimage(view))
@@ -370,11 +367,11 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
                 self.mode = "idle"
                 self.status_lbl.setText("Stop bar set.")
             self.redraw()
-        elif self.mode == "draw_dir":
-            self.dir_pts_px.append([x_px, y_px])
-            if len(self.dir_pts_px) == 2:
+        elif self.mode == "draw_divider":
+            self.divider_pts_px.append([x_px, y_px])
+            if len(self.divider_pts_px) == 2:
                 self.mode = "idle"
-                self.status_lbl.setText("Direction arrow set.")
+                self.status_lbl.setText("Divider line set.")
             self.redraw()
         else:
             # idle – no special behavior
@@ -385,17 +382,19 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
     def _start_draw_stopbar(self):
         self.mode = "draw_stopbar"
         self.stopbar_pts_px = []
-        self.status_lbl.setText("Click two points on the stop bar.")
+        self.status_lbl.setText("Click two points on the stop bar (across lanes).")
 
-    def _start_draw_dir(self):
-        self.mode = "draw_dir"
-        self.dir_pts_px = []
-        self.status_lbl.setText("Click two points along lane direction (toward camera).")
+    def _start_draw_divider(self):
+        self.mode = "draw_divider"
+        self.divider_pts_px = []
+        self.status_lbl.setText(
+            "Click two points to draw the divider line (splits flows)."
+        )
 
     def _clear_geometry(self):
         self.mode = "idle"
         self.stopbar_pts_px = []
-        self.dir_pts_px = []
+        self.divider_pts_px = []
         self.status_lbl.setText("Geometry cleared.")
         self.redraw()
 
@@ -404,6 +403,8 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
     def ensure_metadata_schema(self):
         """
         Create a simple metadata table if it doesn't exist yet.
+        Stores stop bar + divider line in both pixel and meter space,
+        plus a braking window for analysis.
         """
         db = self.ch.db
         sql = f"""
@@ -411,16 +412,31 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
         (
             intersection_id String,
             approach_id String,
+
+            -- stop bar in ortho pixels
             stopbar_px_x1 Float64,
             stopbar_px_y1 Float64,
             stopbar_px_x2 Float64,
             stopbar_px_y2 Float64,
+
+            -- stop bar in map meters (same CRS as the GeoTIFF)
             stopbar_m_x1 Float64,
             stopbar_m_y1 Float64,
             stopbar_m_x2 Float64,
             stopbar_m_y2 Float64,
-            lane_dir_x Float64,
-            lane_dir_y Float64,
+
+            -- divider line in ortho pixels
+            divider_px_x1 Float64,
+            divider_px_y1 Float64,
+            divider_px_x2 Float64,
+            divider_px_y2 Float64,
+
+            -- divider line in map meters
+            divider_m_x1 Float64,
+            divider_m_y1 Float64,
+            divider_m_x2 Float64,
+            divider_m_y2 Float64,
+
             braking_window_m Float64,
             created_at DateTime DEFAULT now()
         )
@@ -436,13 +452,18 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
         X, Y = self.ortho_transform * (x_px, y_px)
         return float(X), float(Y)
 
+
     def save_to_db(self):
         """
         Save current geometry as one row in stopbar_metadata.
+        Requires:
+          - 2 stop bar points
+          - 2 divider points
+          - intersection_id, approach_id
         """
-        if len(self.stopbar_pts_px) != 2 or len(self.dir_pts_px) != 2:
+        if len(self.stopbar_pts_px) != 2 or len(self.divider_pts_px) != 2:
             self.status_lbl.setText(
-                "Need both stop bar (2 pts) and direction (2 pts) before saving."
+                "Need both stop bar (2 pts) and divider (2 pts) before saving."
             )
             return
 
@@ -459,7 +480,7 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
             return
 
         (sx1, sy1), (sx2, sy2) = self.stopbar_pts_px
-        (dx1, dy1), (dx2, dy2) = self.dir_pts_px
+        (dx1, dy1), (dx2, dy2) = self.divider_pts_px
 
         smx1, smy1 = self._px_to_m(sx1, sy1)
         smx2, smy2 = self._px_to_m(sx2, sy2)
@@ -467,30 +488,28 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
         dmx1, dmy1 = self._px_to_m(dx1, dy1)
         dmx2, dmy2 = self._px_to_m(dx2, dy2)
 
-        dir_x = dmx2 - dmx1
-        dir_y = dmy2 - dmy1
-        norm = math.hypot(dir_x, dir_y) or 1.0
-        dir_x /= norm
-        dir_y /= norm
-
         # escape quotes in IDs
         isect_sql = intersection_id.replace("'", "\\'")
         appr_sql = approach_id.replace("'", "\\'")
 
         db = self.ch.db
         sql = f"""
-        INSERT INTO {db}.stopbar_metadata (
+        INSERT INTO {db}.stopbar_metadata
+        (
             intersection_id, approach_id,
             stopbar_px_x1, stopbar_px_y1, stopbar_px_x2, stopbar_px_y2,
             stopbar_m_x1, stopbar_m_y1, stopbar_m_x2, stopbar_m_y2,
-            lane_dir_x, lane_dir_y,
+            divider_px_x1, divider_px_y1, divider_px_x2, divider_px_y2,
+            divider_m_x1, divider_m_y1, divider_m_x2, divider_m_y2,
             braking_window_m
         )
-        VALUES (
+        VALUES
+        (
             '{isect_sql}', '{appr_sql}',
             {sx1}, {sy1}, {sx2}, {sy2},
             {smx1}, {smy1}, {smx2}, {smy2},
-            {dir_x}, {dir_y},
+            {dx1}, {dy1}, {dx2}, {dy2},
+            {dmx1}, {dmy1}, {dmx2}, {dmy2},
             {braking_window_m}
         )
         """
@@ -517,7 +536,7 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
         sql = f"""
         SELECT
             stopbar_px_x1, stopbar_px_y1, stopbar_px_x2, stopbar_px_y2,
-            lane_dir_x, lane_dir_y,
+            divider_px_x1, divider_px_y1, divider_px_x2, divider_px_y2,
             braking_window_m
         FROM {db}.stopbar_metadata
         WHERE intersection_id = '{isect_sql}'
@@ -538,24 +557,14 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
             return
 
         row = json.loads(text.splitlines()[0])
-        sx1 = row["stopbar_px_x1"]
-        sy1 = row["stopbar_px_y1"]
-        sx2 = row["stopbar_px_x2"]
-        sy2 = row["stopbar_px_y2"]
-        self.stopbar_pts_px = [[sx1, sy1], [sx2, sy2]]
 
-        # we don't reconstruct the exact direction points; we just show direction
-        # using the unit vector and stopbar midpoint.
-        dir_x = row["lane_dir_x"]
-        dir_y = row["lane_dir_y"]
-        mid_x = 0.5 * (sx1 + sx2)
-        mid_y = 0.5 * (sy1 + sy2)
-        # create an arbitrary arrow ~20 px long in pixel space
-        arrow_len = 50.0
-        self.dir_pts_px = [
-            [mid_x - dir_x * arrow_len, mid_y - dir_y * arrow_len],
-            [mid_x + dir_x * arrow_len, mid_y + dir_y * arrow_len],
-        ]
+        sx1 = row["stopbar_px_x1"]; sy1 = row["stopbar_px_y1"]
+        sx2 = row["stopbar_px_x2"]; sy2 = row["stopbar_px_y2"]
+        dx1 = row["divider_px_x1"]; dy1 = row["divider_px_y1"]
+        dx2 = row["divider_px_x2"]; dy2 = row["divider_px_y2"]
+
+        self.stopbar_pts_px = [[sx1, sy1], [sx2, sy2]]
+        self.divider_pts_px = [[dx1, dy1], [dx2, dy2]]
 
         self.edit_brake_window.setText(str(row["braking_window_m"]))
         self.status_lbl.setText("Loaded geometry from ClickHouse.")
@@ -567,10 +576,10 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
         mode_txt = {
             "idle": "Idle",
             "draw_stopbar": "Drawing stop bar",
-            "draw_dir": "Drawing direction arrow",
+            "draw_divider": "Drawing divider line",
         }.get(self.mode, self.mode)
         sb = "yes" if len(self.stopbar_pts_px) == 2 else "no"
-        dr = "yes" if len(self.dir_pts_px) == 2 else "no"
+        dv = "yes" if len(self.divider_pts_px) == 2 else "no"
         self.status_lbl.setText(
-            f"Mode: {mode_txt} | Stop bar set: {sb} | Direction set: {dr}"
+            f"Mode: {mode_txt} | Stop bar set: {sb} | Divider set: {dv}"
         )
