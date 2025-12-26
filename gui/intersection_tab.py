@@ -18,6 +18,8 @@ ORTHO_PATH = "ortho_zoom.tif"   # must match what you use elsewhere
 ACTIVE_BORDER   = "QLabel { border: 2px solid #4da3ff; }"
 INACTIVE_BORDER = "QLabel { border: 1px solid #555; }"
 
+US_SURVEY_FT_TO_M = 0.30480060960121924
+
 
 def to_8bit_rgb(arr, nodata=None):
     if arr.ndim == 2:
@@ -445,12 +447,14 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
         """
         self.ch._post_sql(sql, use_db=False)
 
+
     def _px_to_m(self, x_px, y_px):
         """
-        Convert ortho pixel coords -> map meters using the GeoTIFF affine.
+        Convert ortho pixel coords -> meters.
+        NOTE: ortho_zoom.tif CRS is EPSG:6438 (US survey foot), so we must convert.
         """
-        X, Y = self.ortho_transform * (x_px, y_px)
-        return float(X), float(Y)
+        X_ft, Y_ft = self.ortho_transform * (x_px, y_px)  # CRS units: US survey feet
+        return float(X_ft) * US_SURVEY_FT_TO_M, float(Y_ft) * US_SURVEY_FT_TO_M
 
 
     def save_to_db(self):
