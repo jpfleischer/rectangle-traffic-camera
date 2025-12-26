@@ -421,11 +421,11 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
             stopbar_px_x2 Float64,
             stopbar_px_y2 Float64,
 
-            -- stop bar in map meters (same CRS as the GeoTIFF)
-            stopbar_m_x1 Float64,
-            stopbar_m_y1 Float64,
-            stopbar_m_x2 Float64,
-            stopbar_m_y2 Float64,
+            -- stop bar in GeoTIFF CRS linear units (EPSG units; e.g. US survey foot)
+            stopbar_u_x1 Float64,
+            stopbar_u_y1 Float64,
+            stopbar_u_x2 Float64,
+            stopbar_u_y2 Float64,
 
             -- divider line in ortho pixels
             divider_px_x1 Float64,
@@ -433,13 +433,14 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
             divider_px_x2 Float64,
             divider_px_y2 Float64,
 
-            -- divider line in map meters
-            divider_m_x1 Float64,
-            divider_m_y1 Float64,
-            divider_m_x2 Float64,
-            divider_m_y2 Float64,
+            -- divider line in GeoTIFF CRS linear units
+            divider_u_x1 Float64,
+            divider_u_y1 Float64,
+            divider_u_x2 Float64,
+            divider_u_y2 Float64,
 
-            braking_window_m Float64,
+            -- braking window in CRS linear units
+            braking_window_u Float64,
             created_at DateTime DEFAULT now()
         )
         ENGINE = MergeTree
@@ -448,13 +449,16 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
         self.ch._post_sql(sql, use_db=False)
 
 
-    def _px_to_m(self, x_px, y_px):
+    def _px_to_u(self, x_px, y_px):
         """
-        Convert ortho pixel coords -> meters.
-        NOTE: ortho_zoom.tif CRS is EPSG:6438 (US survey foot), so we must convert.
+        Convert ortho pixel coords -> GeoTIFF CRS linear units (EPSG units).
+        For EPSG:6438 this is US survey feet.
         """
-        X_ft, Y_ft = self.ortho_transform * (x_px, y_px)  # CRS units: US survey feet
-        return float(X_ft) * US_SURVEY_FT_TO_M, float(Y_ft) * US_SURVEY_FT_TO_M
+        X_u, Y_u = self.ortho_transform * (x_px, y_px)
+        return float(X_u), float(Y_u)
+
+    def _m_to_u(self, m: float) -> float:
+        return float(m) / US_SURVEY_FT_TO_M
 
 
     def save_to_db(self):
@@ -479,6 +483,8 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
 
         try:
             braking_window_m = float(self.edit_brake_window.text().strip() or "0")
+            braking_window_u = self._m_to_u(braking_window_m)
+
         except ValueError:
             self.status_lbl.setText("Braking window must be a number (meters).")
             return
@@ -486,11 +492,11 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
         (sx1, sy1), (sx2, sy2) = self.stopbar_pts_px
         (dx1, dy1), (dx2, dy2) = self.divider_pts_px
 
-        smx1, smy1 = self._px_to_m(sx1, sy1)
-        smx2, smy2 = self._px_to_m(sx2, sy2)
+        su_x1, su_y1 = self._px_to_u(sx1, sy1)
+        su_x2, su_y2 = self._px_to_u(sx2, sy2)
 
-        dmx1, dmy1 = self._px_to_m(dx1, dy1)
-        dmx2, dmy2 = self._px_to_m(dx2, dy2)
+        du_x1, du_y1 = self._px_to_u(dx1, dy1)
+        du_x2, du_y2 = self._px_to_u(dx2, dy2)
 
         # escape quotes in IDs
         isect_sql = intersection_id.replace("'", "\\'")
@@ -502,19 +508,19 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
         (
             intersection_id, approach_id,
             stopbar_px_x1, stopbar_px_y1, stopbar_px_x2, stopbar_px_y2,
-            stopbar_m_x1, stopbar_m_y1, stopbar_m_x2, stopbar_m_y2,
+            stopbar_u_x1, stopbar_u_y1, stopbar_u_x2, stopbar_u_y2,
             divider_px_x1, divider_px_y1, divider_px_x2, divider_px_y2,
-            divider_m_x1, divider_m_y1, divider_m_x2, divider_m_y2,
-            braking_window_m
+            divider_u_x1, divider_u_y1, divider_u_x2, divider_u_y2,
+            braking_window_u
         )
         VALUES
         (
             '{isect_sql}', '{appr_sql}',
             {sx1}, {sy1}, {sx2}, {sy2},
-            {smx1}, {smy1}, {smx2}, {smy2},
+            {su_x1}, {su_y1}, {su_x2}, {su_y2},
             {dx1}, {dy1}, {dx2}, {dy2},
-            {dmx1}, {dmy1}, {dmx2}, {dmy2},
-            {braking_window_m}
+            {du_x1}, {du_y1}, {du_x2}, {du_y2},
+            {braking_window_u}
         )
         """
         try:
@@ -541,7 +547,7 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
         SELECT
             stopbar_px_x1, stopbar_px_y1, stopbar_px_x2, stopbar_px_y2,
             divider_px_x1, divider_px_y1, divider_px_x2, divider_px_y2,
-            braking_window_m
+            braking_window_u
         FROM {db}.stopbar_metadata
         WHERE intersection_id = '{isect_sql}'
           AND approach_id = '{appr_sql}'
@@ -570,7 +576,10 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
         self.stopbar_pts_px = [[sx1, sy1], [sx2, sy2]]
         self.divider_pts_px = [[dx1, dy1], [dx2, dy2]]
 
-        self.edit_brake_window.setText(str(row["braking_window_m"]))
+        bw_u = float(row["braking_window_u"])
+        self.edit_brake_window.setText(str(bw_u * US_SURVEY_FT_TO_M))
+
+
         self.status_lbl.setText("Loaded geometry from ClickHouse.")
         self.redraw()
 

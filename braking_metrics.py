@@ -34,12 +34,14 @@ Pipeline:
 import argparse
 import json
 import logging
-import math
 import os
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+import dotenv
+
+dotenv.load_dotenv()
 
 import numpy as np
 
@@ -123,6 +125,64 @@ def ch_query_json_each_row(ch: ClickHouseHTTP, sql: str) -> List[dict]:
         rows.append(json.loads(line))
     return rows
 
+
+
+def _infer_units_to_m_factor_from_ortho() -> float:
+    """
+    Returns multiplier to convert (GeoTIFF CRS linear units) -> meters.
+
+    - If ortho CRS is meters: returns 1.0
+    - If ortho CRS is US survey foot: returns ~0.3048006096
+    - If we can't read ortho: fall back to env, else assume meters.
+    """
+    # Hard override if you want to force it:
+    #   export ORTHO_UNITS_TO_M=0.30480060960121924
+    v = os.getenv("ORTHO_UNITS_TO_M")
+    if v:
+        try:
+            f = float(v)
+            if f > 0:
+                return f
+        except Exception:
+            pass
+
+    ortho_path = os.getenv("ORTHO_PATH", "ortho_zoom.tif")
+    try:
+        import rasterio as rio
+        with rio.open(ortho_path) as src:
+            crs = src.crs
+            if crs is None:
+                return 1.0
+            # rasterio gives you the linear units factor if it knows it
+            try:
+                # this is exactly what you printed earlier
+                return float(crs.linear_units_factor[1])
+            except Exception:
+                # last-resort: common foot cases
+                units = (getattr(crs, "linear_units", None) or "").lower()
+                if "us survey foot" in units:
+                    return 0.30480060960121924
+                if units in ("foot", "feet"):
+                    return 0.3048
+                return 1.0
+    except Exception:
+        # If we can't read the ortho, do NOT guess wildly.
+        # But treating as meters is safer than silently scaling wrong.
+        return 1.0
+
+
+_UNITS_TO_M = _infer_units_to_m_factor_from_ortho()
+
+
+def units_to_m(x: float) -> float:
+    """GeoTIFF CRS linear units -> meters."""
+    return float(x) * _UNITS_TO_M
+
+
+def units2_to_m_xy(x: float, y: float) -> tuple[float, float]:
+    return (units_to_m(x), units_to_m(y))
+
+
 def fetch_geometry(
     ch: ClickHouseHTTP,
     intersection_id: str,
@@ -138,11 +198,11 @@ def fetch_geometry(
     SELECT
         intersection_id,
         approach_id,
-        stopbar_m_x1, stopbar_m_y1,
-        stopbar_m_x2, stopbar_m_y2,
-        divider_m_x1, divider_m_y1,
-        divider_m_x2, divider_m_y2,
-        braking_window_m
+        stopbar_u_x1, stopbar_u_y1,
+        stopbar_u_x2, stopbar_u_y2,
+        divider_u_x1, divider_u_y1,
+        divider_u_x2, divider_u_y2,
+        braking_window_u
     FROM {db}.stopbar_metadata
     WHERE intersection_id = '{isect_sql}'
       AND approach_id = '{appr_sql}'
@@ -159,26 +219,31 @@ def fetch_geometry(
         )
     row = rows[0]
 
-    sx1 = float(row["stopbar_m_x1"]); sy1 = float(row["stopbar_m_y1"])
-    sx2 = float(row["stopbar_m_x2"]); sy2 = float(row["stopbar_m_y2"])
-    cx  = 0.5 * (sx1 + sx2)
-    cy  = 0.5 * (sy1 + sy2)
+    sx1_u = float(row["stopbar_u_x1"]); sy1_u = float(row["stopbar_u_y1"])
+    sx2_u = float(row["stopbar_u_x2"]); sy2_u = float(row["stopbar_u_y2"])
 
-    bw = float(row.get("braking_window_m", 0.0) or 0.0)
-    if bw <= 0:
-        bw = default_window_m
+    sx1_m, sy1_m = units2_to_m_xy(sx1_u, sy1_u)
+    sx2_m, sy2_m = units2_to_m_xy(sx2_u, sy2_u)
+    cx_m = 0.5 * (sx1_m + sx2_m)
+    cy_m = 0.5 * (sy1_m + sy2_m)
 
-    d1 = (float(row["divider_m_x1"]), float(row["divider_m_y1"]))
-    d2 = (float(row["divider_m_x2"]), float(row["divider_m_y2"]))
+    bw_u = float(row.get("braking_window_u", 0.0) or 0.0)
+    bw_m = default_window_m if bw_u <= 0 else units_to_m(bw_u)
+
+    d1_u = (float(row["divider_u_x1"]), float(row["divider_u_y1"]))
+    d2_u = (float(row["divider_u_x2"]), float(row["divider_u_y2"]))
+    d1_m = units2_to_m_xy(*d1_u)
+    d2_m = units2_to_m_xy(*d2_u)
 
     return Geometry(
         intersection_id=row["intersection_id"],
         approach_id=row["approach_id"],
-        stopbar_center=(cx, cy),
-        braking_window_m=bw,
-        divider_p1=d1,
-        divider_p2=d2,
+        stopbar_center=(cx_m, cy_m),
+        braking_window_m=bw_m,
+        divider_p1=d1_m,
+        divider_p2=d2_m,
     )
+
 
 def fetch_tracks(
     ch: ClickHouseHTTP,
@@ -553,18 +618,17 @@ def compute_braking_for_track(
         if a_min > -accel_trigger:
             continue
 
-        # Severity by instantaneous decel (min a)
-        if a_min <= severe_thresh:
+        avg_decel = dv_total / dt_total   # positive magnitude
+
+        if avg_decel >= -severe_thresh:        # thresholds passed as negative currently
             severity = "severe"
-        elif a_min <= moderate_thresh:
+        elif avg_decel >= -moderate_thresh:
             severity = "moderate"
-        elif a_min <= mild_thresh:
+        elif avg_decel >= -mild_thresh:
             severity = "mild"
         else:
             continue
 
-        # Still compute avg decel for reporting (optional)
-        a_avg = -(dv_total / dt_total)
 
         cls = samples[0].cls
 
@@ -594,7 +658,7 @@ def compute_braking_for_track(
                 v_end=v_exit,
                 dv=dv_total,
                 a_min=a_min,
-                avg_decel=a_avg,           # avg decel
+                avg_decel=avg_decel,           # avg decel
                 severity=severity,
                 event_ts=event_ts,
             )
@@ -604,7 +668,7 @@ def compute_braking_for_track(
         return []
 
     # keep strongest per track
-    events.sort(key=lambda ev: ev.a_min)  # most negative first
+    events.sort(key=lambda ev: (ev.avg_decel, ev.dv), reverse=True)
     return [events[0]]
 
 
@@ -719,9 +783,13 @@ def run(args: argparse.Namespace) -> None:
     logger.info("Fetching geometry for intersection=%s approach=%s",
                 args.intersection_id, args.approach_id)
     geom = fetch_geometry(ch, args.intersection_id, args.approach_id)
+    logger.info("GeoTIFF units->meters factor: %.12f", _UNITS_TO_M)
+
 
     if args.stopbar_x is not None and args.stopbar_y is not None:
-        geom.stopbar_center = (args.stopbar_x, args.stopbar_y)
+        # CLI override is in METERS (consistent with the "real fix")
+        geom.stopbar_center = (float(args.stopbar_x), float(args.stopbar_y))
+
         logger.info("Overriding stopbar center to (%.3f, %.3f)",
                     geom.stopbar_center[0], geom.stopbar_center[1])
 
