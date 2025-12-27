@@ -14,6 +14,9 @@ import rasterio as rio
 from rasterio.enums import Resampling
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from ortho_overlay import save_overlay_figure
+
+
 # ---- I/O paths ----
 CAM_PATH   = "camera_frame.png"
 ORTHO_PATH = "ortho_zoom.tif"
@@ -454,17 +457,36 @@ class PairingTab(QtWidgets.QWidget):
             borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0)
         )
 
-        # Mask to convex hull of *inlier* destination points to avoid extrapolation
-        hull_pts = map_arr[inl].astype(np.float32)
-        if len(hull_pts) >= 3:
-            hull = cv2.convexHull(hull_pts).astype(np.int32)
-            mask = np.zeros((self.ortho_h, self.ortho_w), np.uint8)
-            cv2.fillConvexPoly(mask, hull, 255)
-            bev = cv2.bitwise_and(bev, bev, mask=mask)
+
+        # Full projected footprint of the entire camera frame (not just inlier hull)
+        cam_mask = np.full((self.cam_h, self.cam_w), 255, dtype=np.uint8)  # all pixels valid in camera
+        footprint = cv2.warpPerspective(
+            cam_mask, H, (self.ortho_w, self.ortho_h),
+            flags=cv2.INTER_NEAREST,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0
+        )
+
+        # Optional: clean up jaggies / tiny holes
+        kernel = np.ones((3, 3), np.uint8)
+        footprint = cv2.morphologyEx(footprint, cv2.MORPH_CLOSE, kernel, iterations=1)
 
         # Save warp (use a distinct filename to not clobber LSQ result)
         out_path = WARP_OUT.replace(".png", "_robust.png")
         cv2.imwrite(out_path, bev)
+
+        overlay_path = out_path.replace(".png", "_overlay.png")
+        save_overlay_figure(
+            ortho_path=ORTHO_PATH,
+            bev_bgr=bev,          # <-- keep full bev
+            mask_u8=footprint,    # <-- use full footprint mask
+            out_path=overlay_path,
+            alpha_strength=0.70,
+            background_darken=0.65,
+            draw_outline=True,
+            outline_thickness=3,
+        )
+
 
         # Persist points JSON
         try:
