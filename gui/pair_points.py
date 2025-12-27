@@ -31,6 +31,10 @@ MAX_ITERS       = 10000
 CONFIDENCE      = 0.999
 REFINE_ITERS    = 10
 
+CAM_GUI_W = 1280
+CAM_GUI_H = 720
+
+
 ACTIVE_BORDER   = "QLabel { border: 2px solid #4da3ff; }"
 INACTIVE_BORDER = "QLabel { border: 1px solid #555; }"
 
@@ -109,12 +113,30 @@ class PairingTab(QtWidgets.QWidget):
         self.setWindowTitle("RoadPairer")
         self.resize(1400, 900)
 
-        # ---- load camera ----
-        cam_bgr = cv2.imread(CAM_PATH, cv2.IMREAD_COLOR)
-        if cam_bgr is None:
+        # ---- load camera (FULL RES) ----
+        cam_full = cv2.imread(CAM_PATH, cv2.IMREAD_COLOR)
+        if cam_full is None:
             raise SystemExit(f"Could not read {CAM_PATH}")
-        self.cam_bgr = cam_bgr
-        self.cam_h, self.cam_w = cam_bgr.shape[:2]
+
+        self.cam_bgr_full = cam_full
+        self.cam_h_full, self.cam_w_full = cam_full.shape[:2]
+
+        # ---- optional GUI downscale to <= 1280x720 while preserving aspect ----
+        scale_w = CAM_GUI_W / float(self.cam_w_full)
+        scale_h = CAM_GUI_H / float(self.cam_h_full)
+        self.cam_disp_scale = min(1.0, scale_w, scale_h)   # don't upscale
+
+        self.cam_w = int(round(self.cam_w_full * self.cam_disp_scale))
+        self.cam_h = int(round(self.cam_h_full * self.cam_disp_scale))
+
+        if self.cam_disp_scale != 1.0:
+            self.cam_bgr = cv2.resize(self.cam_bgr_full, (self.cam_w, self.cam_h), interpolation=cv2.INTER_AREA)
+        else:
+            self.cam_bgr = self.cam_bgr_full
+
+        self.cam_full_per_disp = 1.0 / self.cam_disp_scale if self.cam_disp_scale > 0 else 1.0
+
+
 
         # ---- load ortho preview ----
         with rio.open(ORTHO_PATH) as src:
@@ -349,28 +371,60 @@ class PairingTab(QtWidgets.QWidget):
         )
         if not path:
             return
+
         img = cv2.imread(path, cv2.IMREAD_COLOR)
         if img is None:
             QtWidgets.QMessageBox.critical(self, "Load failed", f"Could not read image:\n{path}")
             return
-        h, w = img.shape[:2]
-        if (h, w) != (self.cam_h, self.cam_w):
-            QtWidgets.QMessageBox.warning(
-                self, "Resolution mismatch",
-                f"Expected {self.cam_w}×{self.cam_h}, got {w}×{h}. "
-                "Swap cancelled to preserve existing point coordinates."
-            )
-            return
 
-        # Accept swap (points retained because resolution matches)
-        self.cam_bgr = img
+        new_h, new_w = img.shape[:2]
+        old_w, old_h = self.cam_w_full, self.cam_h_full
+
+        have_points = len(self.cam_pts) > 0
+
+        # If resolution differs and we have points, try to rescale them (only if aspect matches)
+        if (new_w, new_h) != (old_w, old_h) and have_points:
+            old_ar = old_w / float(old_h)
+            new_ar = new_w / float(new_h)
+
+            if abs(old_ar - new_ar) > 1e-6:
+                QtWidgets.QMessageBox.warning(
+                    self, "Resolution mismatch",
+                    f"Current base camera is {old_w}×{old_h}, new image is {new_w}×{new_h}.\n"
+                    "Aspect ratio differs, so existing points cannot be safely rescaled.\n"
+                    "Swap cancelled."
+                )
+                return
+
+            sx = new_w / float(old_w)
+            sy = new_h / float(old_h)
+
+            # rescale FULL-res stored points
+            self.cam_pts = [[int(round(x * sx)), int(round(y * sy))] for (x, y) in self.cam_pts]
+
+        # Accept swap: update FULL image/dims
+        self.cam_bgr_full = img
+        self.cam_w_full, self.cam_h_full = new_w, new_h
         self.cam_path = path
-        # keep cam_pts/map_pts as-is; invalidate any inlier coloring until next solve
         self.inlier_mask = None
 
-        self._update_status(f"Swapped camera image to: {path}")
-        self._draw_cam()
+        # Recompute display scaling + display image
+        scale_w = CAM_GUI_W / float(self.cam_w_full)
+        scale_h = CAM_GUI_H / float(self.cam_h_full)
+        self.cam_disp_scale = min(1.0, scale_w, scale_h)   # don't upscale
 
+        self.cam_w = int(round(self.cam_w_full * self.cam_disp_scale))
+        self.cam_h = int(round(self.cam_h_full * self.cam_disp_scale))
+
+        if self.cam_disp_scale != 1.0:
+            self.cam_bgr = cv2.resize(self.cam_bgr_full, (self.cam_w, self.cam_h), interpolation=cv2.INTER_AREA)
+        else:
+            self.cam_bgr = self.cam_bgr_full
+
+        self.cam_full_per_disp = 1.0 / self.cam_disp_scale if self.cam_disp_scale > 0 else 1.0
+
+        self._update_status(f"Swapped camera image to: {path}")
+        self.redraw_all()
 
     def _find_homography_compat(self, cam_arr, map_arr, thr_px=3.0):
         """
@@ -452,14 +506,14 @@ class PairingTab(QtWidgets.QWidget):
 
         # Warp to full ortho canvas with constant borders
         bev = cv2.warpPerspective(
-            self.cam_bgr, H, (self.ortho_w, self.ortho_h),
+            self.cam_bgr_full, H, (self.ortho_w, self.ortho_h),
             flags=cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0)
         )
 
 
         # Full projected footprint of the entire camera frame (not just inlier hull)
-        cam_mask = np.full((self.cam_h, self.cam_w), 255, dtype=np.uint8)  # all pixels valid in camera
+        cam_mask = np.full((self.cam_h_full, self.cam_w_full), 255, dtype=np.uint8)
         footprint = cv2.warpPerspective(
             cam_mask, H, (self.ortho_w, self.ortho_h),
             flags=cv2.INTER_NEAREST,
@@ -562,9 +616,14 @@ class PairingTab(QtWidgets.QWidget):
         view = big[self.cam_pan_y:self.cam_pan_y+view_h, self.cam_pan_x:self.cam_pan_x+view_w].copy()
 
         # draw points (color by inlier mask if available)
-        for i, (x, y) in enumerate(self.cam_pts, 1):
+        for i, (x_full, y_full) in enumerate(self.cam_pts, 1):
+            # full -> display
+            x = x_full * self.cam_disp_scale
+            y = y_full * self.cam_disp_scale
+
             xd = int(round(x * eff)) - self.cam_pan_x
             yd = int(round(y * eff)) - self.cam_pan_y
+
             if 0 <= xd < view_w and 0 <= yd < view_h:
                 color = (0,255,0)  # default green
                 if self.inlier_mask is not None and i-1 < len(self.inlier_mask):
@@ -611,13 +670,23 @@ class PairingTab(QtWidgets.QWidget):
         view_h = max(1, self.cam_label.height())
         base_scale = min(view_w / self.cam_w, view_h / self.cam_h)
         eff = base_scale * self.cam_zoom
-        x_px = int(round((self.cam_pan_x + x) / eff))
-        y_px = int(round((self.cam_pan_y + y) / eff))
-        x_px = clamp(x_px, 0, self.cam_w - 1)
-        y_px = clamp(y_px, 0, self.cam_h - 1)
-        self.cam_pts.append([x_px, y_px])
+
+        # x_px/y_px are in DISPLAY image pixel coordinates
+        x_disp = int(round((self.cam_pan_x + x) / eff))
+        y_disp = int(round((self.cam_pan_y + y) / eff))
+        x_disp = clamp(x_disp, 0, self.cam_w - 1)
+        y_disp = clamp(y_disp, 0, self.cam_h - 1)
+
+        # convert DISPLAY -> FULL
+        x_full = int(round(x_disp * self.cam_full_per_disp))
+        y_full = int(round(y_disp * self.cam_full_per_disp))
+        x_full = clamp(x_full, 0, self.cam_w_full - 1)
+        y_full = clamp(y_full, 0, self.cam_h_full - 1)
+
+        self.cam_pts.append([x_full, y_full])   # <-- store FULL RES
         self.inlier_mask = None
-        self._update_status(); self._draw_cam()
+        self._update_status()
+        self._draw_cam()
 
     def _on_ortho_click(self, x, y):
         view_w = max(1, self.ortho_label.width())
@@ -745,7 +814,7 @@ class PairingTab(QtWidgets.QWidget):
         # Save outputs
         np.save(H_OUT, H)
         bev = cv2.warpPerspective(
-            self.cam_bgr, H, (self.ortho_w, self.ortho_h),
+            self.cam_bgr_full, H, (self.ortho_w, self.ortho_h),
             flags=cv2.INTER_LINEAR
         )
         cv2.imwrite(WARP_OUT, bev)
@@ -801,7 +870,7 @@ class PairingTab(QtWidgets.QWidget):
             return
 
         # Warp with constant fill (avoid edge streaks)
-        img_rgb = cv2.cvtColor(self.cam_bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        img_rgb = cv2.cvtColor(self.cam_bgr_full, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         out = warp(
             img_rgb,
             tform,                                    # correct direction: cam -> map
