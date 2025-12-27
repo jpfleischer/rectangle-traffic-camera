@@ -1,7 +1,5 @@
 # requirements.txt
 numpy
 requests
-pystac-client
-planetary-computer
 rasterio
 python-dotenv
