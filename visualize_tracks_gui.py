@@ -6,11 +6,11 @@ from collections import defaultdict
 from typing import Dict, List, Tuple, Optional
 from pathlib import Path
 from datetime import datetime, timedelta
-from dotenv import load_dotenv
 
 import numpy as np
 import cv2
 import rasterio as rio
+from rasterio.transform import Affine
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -23,42 +23,34 @@ if str(GUI_DIR) not in sys.path:
 
 from clickhouse_client import ClickHouseHTTP
 
-load_dotenv(dotenv_path=dotenv_path, override=False)
+import dotenv
+dotenv.load_dotenv(str(dotenv_path), override=False)
+
+def ortho_units_to_m(src) -> float:
+    try:
+        return float(src.crs.linear_units_factor[1])
+    except Exception:
+        return 1.0
 
 # ---------- GeoTIFF -> RGB8 (robust) ----------
-def read_ortho_rgb(path: str) -> Tuple[np.ndarray, float]:
+def read_ortho_rgb(path: str):
     with rio.open(path) as src:
-        nodata = src.nodata
-        bands = [1, 2, 3] if src.count >= 3 else [1]
-        arr = src.read(bands)         # (C,H,W)
-        arr = np.moveaxis(arr, 0, 2)  # (H,W,C)
+        units_to_m = ortho_units_to_m(src)
+        m_per_px = abs(src.transform.a) * units_to_m
+        transform = src.transform
 
-        if arr.ndim == 2:
-            arr = np.stack([arr, arr, arr], axis=2)
-        elif arr.shape[2] == 1:
-            arr = np.repeat(arr, 3, axis=2)
-
-        if arr.dtype != np.uint8:
-            o = arr.astype(np.float32)
-            mask = None
-            if nodata is not None:
-                mask = np.any(arr == nodata, axis=2)
-            for c in range(o.shape[2]):
-                ch = o[..., c]
-                vals = ch[~mask] if mask is not None else ch
-                if vals.size == 0:
-                    continue
-                lo, hi = np.percentile(vals, (1, 99))
-                if hi <= lo:
-                    hi = lo + 1.0
-                ch = (ch - lo) / (hi - lo) * 255.0
-                o[..., c] = np.clip(ch, 0, 255)
-            ortho = o.astype(np.uint8)
+        # TEMP: just read 3 bands as uint8-ish display (replace with your robust block)
+        arr = src.read([1, 2, 3]) if src.count >= 3 else src.read(1)
+        if arr.ndim == 3:
+            ortho = np.moveaxis(arr, 0, 2)
         else:
-            ortho = arr.copy()
+            ortho = arr
+            ortho = np.stack([ortho, ortho, ortho], axis=2)
 
-        m_per_px = abs(src.transform.a)  # meters per pixel (x)
-    return ortho, m_per_px
+        if ortho.dtype != np.uint8:
+            ortho = np.clip(ortho, 0, 255).astype(np.uint8)
+
+        return ortho, m_per_px, transform, units_to_m
 
 
 # ---------- Drawing helpers ----------
@@ -178,12 +170,7 @@ def ch_query_json_each_row(ch: ClickHouseHTTP, sql: str) -> List[dict]:
     return rows
 
 
-def load_tracks_interval(
-    ch: ClickHouseHTTP,
-    start_dt: datetime,
-    duration_s: float,
-    video_filter: Optional[str] = None,
-) -> Tuple[Dict[object, List[dict]], List[float], Optional[datetime]]:
+def load_tracks_interval(ch, start_dt, duration_s, transform, units_to_m, video_filter=None):
     """
     Load tracks from trajectories.raw in ClickHouse for a time window.
 
@@ -199,7 +186,7 @@ def load_tracks_interval(
     where = (
         f"WHERE timestamp >= '{start_str}' "
         f"AND timestamp < '{end_str}' "
-        f"AND (map_px_x != 0 OR map_px_y != 0)"
+        f"AND (map_m_x != 0 OR map_m_y != 0)"
     )
     if video_filter:
         safe_video = video_filter.replace("'", "\\'")
@@ -212,8 +199,8 @@ def load_tracks_interval(
         timestamp,
         track_id,
         class,
-        map_px_x,
-        map_px_y
+        map_m_x,
+        map_m_y
     FROM {db}.raw
     {where}
     ORDER BY timestamp, video, track_id
@@ -231,11 +218,22 @@ def load_tracks_interval(
             ts_str = row["timestamp"]
             ts = datetime.fromisoformat(ts_str)
             track_id = int(row["track_id"])
-            x_px = float(row["map_px_x"])
-            y_px = float(row["map_px_y"])
+
+            x_m = float(row["map_m_x"])
+            y_m = float(row["map_m_y"])
+
+            x_u = x_m / units_to_m
+            y_u = y_m / units_to_m
+            col, rowpix = (~transform) * (x_u, y_u)
+
+
+            x_px = float(col)
+            y_px = float(rowpix)
+
             cls = row.get("class", "")
         except Exception:
             continue
+
         samples.append((video, track_id, ts, x_px, y_px, cls))
 
     if not samples:
@@ -316,6 +314,8 @@ class TracksPlayer(QtWidgets.QMainWindow):
         self._video_base_ts_cache: Dict[str, datetime] = {}
         self.pre_event_seconds = 5.0
         self.post_event_seconds = 15.0
+
+        self.jump_playback_lead_s = 3.0
 
         self._build_ui()
         self._load_ortho()
@@ -426,6 +426,13 @@ class TracksPlayer(QtWidgets.QMainWindow):
         form = QtWidgets.QFormLayout()
         self.intersection_edit = QtWidgets.QLineEdit()
         self.approach_edit = QtWidgets.QLineEdit()
+
+        
+        # ✅ Prefill defaults
+        self.intersection_edit.setText("1")
+        self.approach_edit.setText("toward_cam_main")
+
+
         form.addRow("Intersection ID:", self.intersection_edit)
         form.addRow("Approach ID:", self.approach_edit)
         right_layout.addLayout(form)
@@ -463,8 +470,12 @@ class TracksPlayer(QtWidgets.QMainWindow):
         right_layout.addStretch()
 
     def _load_ortho(self):
-        ortho, m_per_px = read_ortho_rgb(self.tif_path)
+        ortho, m_per_px, transform, units_to_m = read_ortho_rgb(self.tif_path)
         self.m_per_px = m_per_px
+        self.transform = transform
+        self.units_to_m = units_to_m
+
+
 
         # Scale to fit in a reasonable window height
         h0, w0 = ortho.shape[:2]
@@ -535,9 +546,15 @@ class TracksPlayer(QtWidgets.QMainWindow):
 
         try:
             tracks, times, t0 = load_tracks_interval(
-                self.ch, start_dt=start_dt, duration_s=duration_s,
-                video_filter=video_filter
+                self.ch,
+                start_dt=start_dt,
+                duration_s=duration_s,
+                transform=self.transform,
+                units_to_m=self.units_to_m,
+                video_filter=video_filter,
             )
+
+
         except Exception as e:
             self.status_label.setText(f"Error loading from ClickHouse: {e}")
             self.tracks = {}
@@ -602,8 +619,8 @@ class TracksPlayer(QtWidgets.QMainWindow):
             self.tracks,
             self.times,
             idx,
-            scale=1.0,  # disp_img is already scaled
-            m_per_px=self.m_per_px / self.scale,  # adjust because disp_img is scaled
+            scale=self.scale,              # <-- scale point coords down to match disp_img
+            m_per_px=self.m_per_px / self.scale,  # <-- this part was already correct
             trail_len=self.trail_len,
             show_trails=self.show_trails,
             highlight_keys=highlight_set,
@@ -781,8 +798,12 @@ class TracksPlayer(QtWidgets.QMainWindow):
                 self.ch,
                 start_dt=window_start,
                 duration_s=duration_s,
+                transform=self.transform,
+                units_to_m=self.units_to_m,
                 video_filter=video,
             )
+
+
         except Exception as e:
             self.status_label.setText(f"Error loading tracks for event: {e}")
             return
@@ -798,9 +819,16 @@ class TracksPlayer(QtWidgets.QMainWindow):
             self._redraw_current_frame()
             return
 
-        # Find closest index to event time
+        # Find closest index to (event time - lead)
         if self.t0 is not None:
-            target_rel = (event_abs_start - self.t0).total_seconds()
+            lead = float(getattr(self, "jump_playback_lead_s", 3.0))
+            target_abs = event_abs_start - timedelta(seconds=lead)
+
+            # Clamp so we don't target before the loaded window
+            if target_abs < self.t0:
+                target_abs = self.t0
+
+            target_rel = (target_abs - self.t0).total_seconds()
             diffs = [abs(t - target_rel) for t in self.times]
             if diffs:
                 self.current_idx = int(np.argmin(diffs))
@@ -829,7 +857,7 @@ def main():
 
     app = QtWidgets.QApplication(sys.argv)
     win = TracksPlayer(tif_path=args.tif)
-    win.resize(1280, 900)
+    win.resize(1800, 900)
     win.show()
     sys.exit(app.exec())
 
