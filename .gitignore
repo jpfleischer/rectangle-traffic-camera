@@ -3,3 +3,4 @@
 *tif
 *jpg
 *.env
+__pycache__/
