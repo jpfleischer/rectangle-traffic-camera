@@ -30,7 +30,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
     ap.add_argument("--window-m", type=float, default=None)
     ap.add_argument("--smooth", type=int, default=3)
-    ap.add_argument("--min-duration", type=float, default=0.2)
+    ap.add_argument("--min-duration", type=float, default=0.1)
 
     ap.add_argument("--write-events", action="store_true")
     ap.add_argument("--divider-side", choices=["positive", "negative"], default="positive")
@@ -41,6 +41,9 @@ def build_argparser() -> argparse.ArgumentParser:
 
     ap.add_argument("--frame-w", type=int, default=1920)
     ap.add_argument("--frame-h", type=int, default=1080)
+    ap.add_argument("--fps", type=float, default=15.0)
+    ap.add_argument("--min-event-frames", type=int, default=4)   # 4 frames ~= 0.2s at 15 fps
+
     ap.add_argument("--edge-margin-px", type=int, default=40)
     ap.add_argument("--edge-tail-frames", type=int, default=8)
     ap.add_argument("--min-post-event-frames", type=int, default=15)
@@ -97,6 +100,8 @@ def main() -> None:
     det_cfg = DetectorConfig(
         smoothing_window=int(args.smooth),
         min_duration=float(args.min_duration),
+        fps=float(args.fps),
+        min_event_frames=int(args.min_event_frames),
     )
     seg_cfg = SegmentSplitterConfig()
     edge_cfg = EdgeVetoConfig(

@@ -59,3 +59,6 @@ class DetectorConfig:
     # event-level approach guard (stronger)
     evt_min_approach_m: float = 0.25
     evt_max_move_away_m: float = 0.40
+
+    fps: float = 15.0
+    min_event_frames: int = 4  # 4 frames ~= 0.2s at 15 fps
