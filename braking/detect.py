@@ -30,6 +30,13 @@ class BrakingEvent:
     a_min: float
     avg_decel: float
     severity: str
+
+    x_evt: float
+    y_evt: float
+    cam_x_evt: float
+    cam_y_evt: float
+    edge_dist_px: float
+
     event_ts: Optional[np.datetime64] = None
 
 
@@ -571,6 +578,40 @@ def compute_braking_for_track(
             while R < len(a) - 1 and np.isfinite(a[R]) and a[R] <= keep_thr:
                 R += 1
 
+            # how far away was it
+
+            ev_k = (L + R) // 2
+
+            x_evt = float(xx[ev_k])
+            y_evt = float(yy[ev_k])
+            r_evt = float(rr[ev_k])
+
+            cx_evt = float(cam_x_seg[ev_k])
+            cy_evt = float(cam_y_seg[ev_k])
+
+            if not (np.isfinite(cx_evt) and np.isfinite(cy_evt)):
+                edge_dist_px = float("nan")
+            else:
+                edge_dist_px = float(min(
+                    cx_evt, (w - 1) - cx_evt,
+                    cy_evt, (h - 1) - cy_evt
+                ))
+
+            if r_evt > 20.0:
+                dbg_drop(dbg, "evt_too_far_r", r_evt=r_evt)
+                continue
+
+
+            if dbg.enabled:
+                dbg.log("EV_POS",
+                        "t", float(tt[ev_k]),
+                        "map", (x_evt, y_evt),
+                        "r", r_evt,
+                        "cam", (cx_evt, cy_evt),
+                        "edge_dist_px", edge_dist_px)
+
+
+
             evt_frames = (R - L + 1)
             if evt_frames < int(det_cfg.min_event_frames):
                 continue
@@ -618,7 +659,7 @@ def compute_braking_for_track(
 
 
             dt_evt = float(tt[R] - tt[L])
-            dr_evt = float(r[L] - r[R])
+            dr_evt = float(rr[L] - rr[R])
 
             if dr_evt < -float(det_cfg.max_move_away_evt):
                 continue
@@ -627,16 +668,20 @@ def compute_braking_for_track(
 
             avg_decel = dv_evt / max(dt_evt, 1e-6)
 
-            if avg_decel >= severe_thresh:
+            SEVERE_MIN_ENTRY = 4.0      # m/s
+            MODERATE_MIN_ENTRY = 2.0    # m/s
+
+            if avg_decel >= severe_thresh and v_entry >= SEVERE_MIN_ENTRY:
                 severity = "severe"
-            elif avg_decel >= moderate_thresh:
+            elif avg_decel >= moderate_thresh and v_entry >= MODERATE_MIN_ENTRY:
                 severity = "moderate"
             elif avg_decel >= mild_thresh:
                 severity = "mild"
             else:
                 continue
 
-            event_ts = compute_event_timestamp(samples, mask, seg_s, seg_e)
+            full_i_evt = int(mask_idx[seg_s + ev_k])
+            event_ts = samples[full_i_evt].ts
 
             event_end_full_idx = int(mask_idx[seg_s + ev_i1])  # note: ev_i1 is within [seg_s, seg_e)
 
@@ -672,13 +717,18 @@ def compute_braking_for_track(
                 t_end=t_end,
                 r_start=float(r[ev_i0]),
                 r_end=float(r[ev_i1]),
-                v_start=float(best.v_entry),
-                v_end=float(best.v_exit),
-                dv=float(best.dv),
+                v_start=float(v_entry),
+                v_end=float(v_exit),
+                dv=float(dv_evt),
                 a_min=float(a_min),
                 avg_decel=float(avg_decel),
                 severity=severity,
                 event_ts=event_ts,
+                x_evt=x_evt,
+                y_evt=y_evt,
+                cam_x_evt=cx_evt,
+                cam_y_evt=cy_evt,
+                edge_dist_px=edge_dist_px,
             )
 
             key = events_dedupe_key(ev, tol_s=0.6)
