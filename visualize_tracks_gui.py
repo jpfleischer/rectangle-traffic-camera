@@ -131,7 +131,8 @@ def render_frame(base_img: np.ndarray,
             thickness = 3
             radius = 7
         else:
-            col = color_for_track(tid)
+            # col = color_for_track(tid)
+            col = (0, 255, 0)
             thickness = 2
             radius = 5
 
@@ -297,7 +298,7 @@ class TracksPlayer(QtWidgets.QMainWindow):
 
 
         self.playing = False
-        self.trail_len = 200
+        self.trail_len = 30
         self.show_trails = True
         self.current_idx = 0
 
@@ -328,6 +329,97 @@ class TracksPlayer(QtWidgets.QMainWindow):
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.on_timer)
         self.timer.start(self.gui_tick_ms)
+
+
+    def on_delete_event_clicked(self):
+        # Figure out which button was clicked
+        btn = self.sender()
+        if btn is None:
+            return
+
+        src_i = btn.property("src_i")
+        if src_i is None:
+            return
+        src_i = int(src_i)
+
+        if src_i < 0 or src_i >= len(self.braking_events):
+            return
+
+        ev = self.braking_events[src_i]
+
+        video = ev.get("video", "")
+        track_id = ev.get("track_id", "")
+        t_start = ev.get("t_start", "")
+        created_at = ev.get("created_at", "")
+
+        msg = (
+            "Are you sure you want to delete this braking event?\n\n"
+            f"video: {video}\n"
+            f"track_id: {track_id}\n"
+            f"t_start: {t_start}\n"
+            f"created_at: {created_at}\n\n"
+            "This will delete it from ClickHouse."
+        )
+
+        resp = QtWidgets.QMessageBox.question(
+            self,
+            "Delete braking event",
+            msg,
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        if resp != QtWidgets.QMessageBox.Yes:
+            return
+
+        ok, err = self._delete_braking_event_in_clickhouse(ev)
+        if not ok:
+            QtWidgets.QMessageBox.critical(self, "Delete failed", err or "Unknown error")
+            return
+
+        # Easiest/cleanest UI refresh: reload the table
+        self.status_label.setText("Delete queued (ClickHouse mutation). Refreshing list...")
+        self.on_load_braking_clicked()
+
+
+    def _delete_braking_event_in_clickhouse(self, ev: dict) -> tuple[bool, str]:
+        if self.ch is None:
+            return False, "ClickHouse client not initialized."
+
+        db = self.ch.db
+
+        # Pull fields used for identity
+        intersection_id = str(ev.get("intersection_id", "")).replace("'", "\\'")
+        approach_id = str(ev.get("approach_id", "")).replace("'", "\\'")
+        video = str(ev.get("video", "")).replace("'", "\\'")
+        track_id = int(ev.get("track_id", 0) or 0)
+
+        # Use floats carefully; keep consistent formatting
+        t_start = float(ev.get("t_start", 0.0) or 0.0)
+        t_end = float(ev.get("t_end", 0.0) or 0.0)
+
+        created_at = str(ev.get("created_at", "")).replace("'", "\\'")
+
+        # Mutation delete (async)
+        sql = f"""
+        ALTER TABLE {db}.braking_events
+        DELETE WHERE
+            intersection_id = '{intersection_id}'
+            AND approach_id = '{approach_id}'
+            AND video = '{video}'
+            AND track_id = {track_id}
+            AND t_start = {t_start}
+            AND t_end = {t_end}
+            AND created_at = '{created_at}'
+        """
+
+        try:
+            # Use your existing HTTP helper
+            self.ch._post_sql(sql, use_db=True)
+        except Exception as e:
+            return False, str(e)
+
+        return True, ""
+
 
     # ---- UI setup ----
     def _build_ui(self):
@@ -389,8 +481,8 @@ class TracksPlayer(QtWidgets.QMainWindow):
         self.left_splitter.addWidget(self.mp4_widget)
 
         # Give initial split (top bigger than bottom, tweak as you like)
-        self.left_splitter.setStretchFactor(0, 3)
-        self.left_splitter.setStretchFactor(1, 2)
+        self.left_splitter.setStretchFactor(0, 1)
+        self.left_splitter.setStretchFactor(1, 3)
 
         # Optional: start with a specific pixel split after window shows
         # (can be finicky pre-show; stretch factors usually enough)
@@ -468,14 +560,18 @@ class TracksPlayer(QtWidgets.QMainWindow):
         self.load_brake_button.clicked.connect(self.on_load_braking_clicked)
         right_layout.addWidget(self.load_brake_button)
 
-        self.brake_table = QtWidgets.QTableWidget(0, 7)
+        self.brake_table = QtWidgets.QTableWidget(0, 8)
         self.brake_table.setHorizontalHeaderLabels([
             "Video", "Track", "Class",
-            "dv", "a_min", "Severity", "Event time"
+            "dv", "a_min", "Severity", "Event time",
+            ""
         ])
         self.brake_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.brake_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.brake_table.setSortingEnabled(True)
+
         self.brake_table.doubleClicked.connect(self.on_braking_event_activated)
+
 
         header = self.brake_table.horizontalHeader()
         header.setSectionResizeMode(QtWidgets.QHeaderView.Interactive)
@@ -489,6 +585,7 @@ class TracksPlayer(QtWidgets.QMainWindow):
         self.brake_table.setColumnWidth(4, 80)   # a_min
         self.brake_table.setColumnWidth(5, 90)   # Severity
         self.brake_table.setColumnWidth(6, 260)  # Event time (nice and wide)
+        self.brake_table.setColumnWidth(7, 40)   # delete icon
 
         right_layout.addWidget(self.brake_table, stretch=1)
 
@@ -707,6 +804,7 @@ class TracksPlayer(QtWidgets.QMainWindow):
 
         self.braking_events = rows
         self._video_base_ts_cache.clear()
+        self.brake_table.setSortingEnabled(False)
         self.brake_table.setRowCount(0)
 
         for i, row in enumerate(rows):
@@ -726,6 +824,7 @@ class TracksPlayer(QtWidgets.QMainWindow):
                 event_ts = ""
 
             self.brake_table.insertRow(i)
+
             values = [
                 video,
                 str(track_id),
@@ -735,9 +834,35 @@ class TracksPlayer(QtWidgets.QMainWindow):
                 severity,
                 event_ts,
             ]
+
             for j, val in enumerate(values):
                 item = QtWidgets.QTableWidgetItem(val)
+
+                # Store the source index on the first column item (so sorting doesn't break double-click)
+                if j == 0:
+                    item.setData(QtCore.Qt.UserRole, i)
+
                 self.brake_table.setItem(i, j, item)
+
+            # After filling items 0..6, add delete button at col 7
+            btn = QtWidgets.QToolButton()
+            btn.setToolTip("Delete this event")
+            btn.setCursor(QtCore.Qt.PointingHandCursor)
+
+            style = self.style()
+            icon = style.standardIcon(QtWidgets.QStyle.SP_TrashIcon)
+            btn.setIcon(icon)
+
+            # Store the source index on the button too (robust even if table is re-sorted)
+            btn.setProperty("src_i", i)
+
+            btn.clicked.connect(self.on_delete_event_clicked)
+            self.brake_table.setCellWidget(i, 7, btn)
+
+
+        self.brake_table.setSortingEnabled(True)
+        self.brake_table.sortItems(6, QtCore.Qt.DescendingOrder)  # optional    
+
 
         self.status_label.setText(
             f"Loaded {len(rows)} braking events for {intersection_id}/{approach_id}. "
@@ -747,10 +872,21 @@ class TracksPlayer(QtWidgets.QMainWindow):
 
     def on_braking_event_activated(self, index: QtCore.QModelIndex):
         row = index.row()
-        if row < 0 or row >= len(self.braking_events):
+        item0 = self.brake_table.item(row, 0)
+        if item0 is None:
             return
-        ev = self.braking_events[row]
+
+        src_i = item0.data(QtCore.Qt.UserRole)
+        if src_i is None:
+            return
+
+        src_i = int(src_i)
+        if src_i < 0 or src_i >= len(self.braking_events):
+            return
+
+        ev = self.braking_events[src_i]
         self.jump_to_braking_event(ev)
+
 
     def _get_video_base_timestamp(self, video: str) -> Optional[datetime]:
         if video in self._video_base_ts_cache:
