@@ -14,6 +14,9 @@ from rasterio.transform import Affine
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from mp4_player import Mp4PlayerTab
+
+
 # --- ClickHouse client import (from gui/) ---
 HERE = Path(__file__).resolve().parent
 dotenv_path = HERE / ".env"
@@ -332,27 +335,34 @@ class TracksPlayer(QtWidgets.QMainWindow):
         self.setCentralWidget(central)
 
         main_layout = QtWidgets.QHBoxLayout(central)
-
-        # Left: image + slider + playback controls
-        
+        # Left: Ortho (top) + MP4 (bottom)
         left_layout = QtWidgets.QVBoxLayout()
         main_layout.addLayout(left_layout, stretch=3)
 
+        self.left_splitter = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+        left_layout.addWidget(self.left_splitter, stretch=1)
+
+        # -----------------------
+        # Top widget: Ortho overlay
+        # -----------------------
+        ortho_widget = QtWidgets.QWidget()
+        ortho_layout = QtWidgets.QVBoxLayout(ortho_widget)
+        ortho_layout.setContentsMargins(0, 0, 0, 0)
 
         self.image_label = QtWidgets.QLabel("No data loaded yet")
         self.image_label.setAlignment(QtCore.Qt.AlignCenter)
-        self.image_label.setMinimumSize(640, 480)
+        self.image_label.setMinimumSize(640, 240)
         self.image_label.setStyleSheet("background-color: black; color: white;")
-        left_layout.addWidget(self.image_label, stretch=1)
+        ortho_layout.addWidget(self.image_label, stretch=1)
 
         self.time_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.time_slider.setMinimum(0)
         self.time_slider.setMaximum(0)
         self.time_slider.valueChanged.connect(self.on_slider_changed)
-        left_layout.addWidget(self.time_slider)
+        ortho_layout.addWidget(self.time_slider)
 
         controls_layout = QtWidgets.QHBoxLayout()
-        left_layout.addLayout(controls_layout)
+        ortho_layout.addLayout(controls_layout)
 
         self.play_button = QtWidgets.QPushButton("Play")
         self.play_button.clicked.connect(self.on_play_clicked)
@@ -368,6 +378,23 @@ class TracksPlayer(QtWidgets.QMainWindow):
         controls_layout.addWidget(self.trails_checkbox)
 
         controls_layout.addStretch()
+
+        self.left_splitter.addWidget(ortho_widget)
+
+        # -----------------------
+        # Bottom widget: MP4 player
+        # -----------------------
+        HERE = Path(__file__).resolve().parent
+        self.mp4_widget = Mp4PlayerTab(base_dir=HERE, error_parent=self)  # your existing class is fine as a widget
+        self.left_splitter.addWidget(self.mp4_widget)
+
+        # Give initial split (top bigger than bottom, tweak as you like)
+        self.left_splitter.setStretchFactor(0, 3)
+        self.left_splitter.setStretchFactor(1, 2)
+
+        # Optional: start with a specific pixel split after window shows
+        # (can be finicky pre-show; stretch factors usually enough)
+        # self.left_splitter.setSizes([600, 400])
 
         # Right: control panel (give it more space)
         right_layout = QtWidgets.QVBoxLayout()
@@ -761,6 +788,13 @@ class TracksPlayer(QtWidgets.QMainWindow):
         track_id = ev.get("track_id", None)
         t_start = float(ev.get("t_start", 0.0))
 
+        # Always scrub/play MP4 too (if available)
+        if hasattr(self, "mp4_widget"):
+            lead = float(getattr(self, "jump_playback_lead_s", 3.0))
+            self.mp4_widget.jump_to(video=video, t_event_s=t_start, lead_s=lead, autoplay=True)
+
+
+
         # Highlight this specific trajectory
         if track_id is not None:
             self.highlight_key = f"{video}#{track_id}"
@@ -857,8 +891,8 @@ def main():
 
     app = QtWidgets.QApplication(sys.argv)
     win = TracksPlayer(tif_path=args.tif)
-    win.resize(1800, 900)
-    win.show()
+    win.showMaximized()
+
     sys.exit(app.exec())
 
 
