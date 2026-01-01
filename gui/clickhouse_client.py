@@ -20,7 +20,6 @@ Usage example:
     ch.insert_csv_rows(rows)
 """
 
-import os
 import time
 import logging
 from typing import List, Optional
@@ -85,43 +84,48 @@ class ClickHouseHTTP:
     # ------------------------------------------------------------------
 
     def video_already_ingested(self, video: str) -> bool:
-        """
-        Return True if any rows already exist in {db}.raw for the given video.
-        """
-        # Very simple escaping of single quotes
-        safe_video = video.replace("'", "\\'")
-        sql = f"SELECT count() FROM {self.db}.raw WHERE video = '{safe_video}'"
-
+        sql = f"SELECT count() FROM {self.db}.raw WHERE video = {{video:String}}"
         try:
-            resp = self._post_sql(sql, use_db=False)
+            resp = self._post_sql(sql, use_db=False, params={"video": video})
             count = int(resp.text.strip())
             return count > 0
         except Exception as e:
             self.logger.error(f"Failed to check existing rows for video={video!r}: {e}")
-            # If ClickHouse is down or this fails, better to process than silently skip
             return False
 
     # ------------------------------------------------------------------
 
-    def _post_sql(self, sql: str, use_db: bool = False, timeout: Optional[int] = None):
+    def _post_sql(
+        self,
+        sql: str,
+        use_db: bool = False,
+        timeout: Optional[int] = None,
+        params: Optional[dict] = None,
+    ):
         """
-        Helper: POST raw SQL to ClickHouse HTTP interface.
-        If use_db is True, sends ?database=<self.db> so unqualified table names use that DB.
+        POST parameterized SQL to ClickHouse HTTP interface.
+
+        Use ClickHouse query parameters:
+        SQL:  ... WHERE video = {video:String}
+        params={"video": "foo.mp4"}  -> sent as param_video
         """
         url = f"http://{self.host}:{self.port}/"
         if use_db:
             url += f"?database={self.db}"
 
+        files = {"query": (None, sql)}
+        if params:
+            for k, v in params.items():
+                files[f"param_{k}"] = (None, str(v))
+
         r = self._session.post(
             url,
-            data=sql.encode("utf-8"),
+            files=files,              # multipart/form-data, like the docs curl -F example
             auth=self._auth,
             timeout=timeout or max(self.timeout, 10),
         )
 
-        # >>> replace r.raise_for_status() with this:
         if r.status_code != 200:
-            # include up to a few hundred chars of the ClickHouse error text
             msg = r.text.strip().replace("\n", " ")[:500]
             raise RuntimeError(f"ClickHouse HTTP {r.status_code}: {msg}")
 

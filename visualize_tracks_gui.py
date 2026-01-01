@@ -34,6 +34,25 @@ def ortho_units_to_m(src) -> float:
         return float(src.crs.linear_units_factor[1])
     except Exception:
         return 1.0
+    
+
+class DeleteWorker(QtCore.QObject):
+    finished = QtCore.Signal(bool, str)  # ok, err
+
+    def __init__(self, ch: ClickHouseHTTP, sql: str, params: Optional[dict] = None):
+        super().__init__()
+        self.ch = ch
+        self.sql = sql
+        self.params = params or {}
+
+    @QtCore.Slot()
+    def run(self):
+        try:
+            self.ch._post_sql(self.sql, use_db=True, params=self.params)
+            self.finished.emit(True, "")
+        except Exception as e:
+            self.finished.emit(False, str(e))
+
 
 # ---------- GeoTIFF -> RGB8 (robust) ----------
 def read_ortho_rgb(path: str):
@@ -159,9 +178,9 @@ def median_dt(times: List[float]) -> float:
 
 
 # ---------- ClickHouse helpers ----------
-def ch_query_json_each_row(ch: ClickHouseHTTP, sql: str) -> List[dict]:
-    """Run a SQL query with FORMAT JSONEachRow and return list of dicts."""
-    resp = ch._post_sql(sql, use_db=True)  # use same DB as ch.db
+def ch_query_json_each_row(ch: ClickHouseHTTP, sql: str, params: Optional[dict] = None) -> List[dict]:
+    """Run a SQL query with FORMAT JSONEachRow and return list of dicts. Supports ClickHouse HTTP params."""
+    resp = ch._post_sql(sql, use_db=True, params=params)
     text = resp.text.strip()
     if not text:
         return []
@@ -184,19 +203,28 @@ def load_tracks_interval(ch, start_dt, duration_s, transform, units_to_m, video_
       t0:    earliest absolute timestamp (datetime) or None
     """
     end_dt = start_dt + timedelta(seconds=duration_s)
+
+    # Use params (no quoting/escaping)
     start_str = start_dt.strftime("%Y-%m-%d %H:%M:%S")
     end_str = end_dt.strftime("%Y-%m-%d %H:%M:%S")
 
-    where = (
-        f"WHERE timestamp >= '{start_str}' "
-        f"AND timestamp < '{end_str}' "
-        f"AND (map_m_x != 0 OR map_m_y != 0)"
-    )
-    if video_filter:
-        safe_video = video_filter.replace("'", "\\'")
-        where += f" AND video = '{safe_video}'"
-
     db = ch.db
+
+    where = (
+        "WHERE timestamp >= {start_ts:DateTime} "
+        "AND timestamp < {end_ts:DateTime} "
+        "AND (map_m_x != 0 OR map_m_y != 0)"
+    )
+
+    params = {
+        "start_ts": start_str,
+        "end_ts": end_str,
+    }
+
+    if video_filter:
+        where += " AND video = {video:String}"
+        params["video"] = video_filter
+
     sql = f"""
     SELECT
         video,
@@ -211,7 +239,7 @@ def load_tracks_interval(ch, start_dt, duration_s, transform, units_to_m, video_
     FORMAT JSONEachRow
     """
 
-    rows = ch_query_json_each_row(ch, sql)
+    rows = ch_query_json_each_row(ch, sql, params=params)
     if not rows:
         return {}, [], None
 
@@ -229,7 +257,6 @@ def load_tracks_interval(ch, start_dt, duration_s, transform, units_to_m, video_
             x_u = x_m / units_to_m
             y_u = y_m / units_to_m
             col, rowpix = (~transform) * (x_u, y_u)
-
 
             x_px = float(col)
             y_px = float(rowpix)
@@ -331,13 +358,147 @@ class TracksPlayer(QtWidgets.QMainWindow):
         self.timer.start(self.gui_tick_ms)
 
 
+    def _build_delete_sql(self, ev: dict) -> tuple[str, dict]:
+        db = self.ch.db
+
+        sql = f"""
+        ALTER TABLE {db}.braking_events
+        DELETE WHERE
+            intersection_id = {{intersection_id:String}}
+            AND approach_id = {{approach_id:String}}
+            AND video = {{video:String}}
+            AND track_id = {{track_id:UInt32}}
+            AND t_start = {{t_start:Float64}}
+            AND t_end = {{t_end:Float64}}
+            AND created_at = {{created_at:String}}
+        """
+
+        params = {
+            "intersection_id": str(ev.get("intersection_id", "")),
+            "approach_id": str(ev.get("approach_id", "")),
+            "video": str(ev.get("video", "")),
+            "track_id": int(ev.get("track_id", 0) or 0),
+            "t_start": float(ev.get("t_start", 0.0) or 0.0),
+            "t_end": float(ev.get("t_end", 0.0) or 0.0),
+            "created_at": str(ev.get("created_at", "")),
+        }
+        return sql, params
+
+    def _start_delete_worker(self, sql: str, params: Optional[dict] = None) -> None:
+        if self.ch is None:
+            self.status_label.setText("ClickHouse client not initialized.")
+            return
+
+        thread = QtCore.QThread(self)
+        worker = DeleteWorker(self.ch, sql, params=params)
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.finished.connect(lambda ok, err: self._on_delete_finished(ok, err, thread, worker))
+
+        # prevent leaks
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+
+        thread.start()
+
+    def _on_delete_finished(self, ok: bool, err: str, thread: QtCore.QThread, worker: QtCore.QObject):
+        if ok:
+            self.status_label.setText("Delete submitted to ClickHouse (background).")
+        else:
+            # we already removed it from UI, so just warn
+            self.status_label.setText(f"Delete failed: {err}")
+
+            
+    def _refresh_brake_table_from_cache(self):
+        self.brake_table.setUpdatesEnabled(False)
+        try:
+            rows = self.braking_events
+
+            self.brake_table.setSortingEnabled(False)
+            self.brake_table.setRowCount(0)
+            for i, row in enumerate(rows):
+                video = row.get("video", "")
+                track_id = row.get("track_id", "")
+                t_start = float(row.get("t_start", 0.0) or 0.0)
+                dv = float(row.get("dv", 0.0) or 0.0)
+                a_min = float(row.get("a_min", 0.0) or 0.0)
+                cls = row.get("class", "")
+                severity = row.get("severity", "")
+
+                base_ts = self._get_video_base_timestamp(video)
+                if base_ts is not None:
+                    event_ts = (base_ts + timedelta(seconds=t_start)).isoformat(sep=" ")
+                else:
+                    event_ts = ""
+
+                self.brake_table.insertRow(i)
+
+                values = [
+                    video,
+                    str(track_id),
+                    cls,
+                    f"{dv:.2f}",
+                    f"{a_min:.2f}",
+                    severity,
+                    event_ts,
+                ]
+
+                for j, val in enumerate(values):
+                    item = QtWidgets.QTableWidgetItem(val)
+                    if j == 0:
+                        item.setData(QtCore.Qt.UserRole, i)  # src_i
+                    self.brake_table.setItem(i, j, item)
+
+                btn = QtWidgets.QToolButton()
+                btn.setToolTip("Delete this event")
+                btn.setCursor(QtCore.Qt.PointingHandCursor)
+                btn.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_TrashIcon))
+                btn.setProperty("src_i", i)
+                btn.clicked.connect(self.on_delete_event_clicked)
+                self.brake_table.setCellWidget(i, 7, btn)
+
+            self.brake_table.setSortingEnabled(True)
+            self.brake_table.sortItems(6, QtCore.Qt.AscendingOrder)
+        finally:
+            self.brake_table.setUpdatesEnabled(True)
+  
+    def _select_brake_row_by_src_i(self, src_i: int) -> None:
+        # Find the visible table row whose column-0 item has UserRole == src_i
+        for row in range(self.brake_table.rowCount()):
+            item0 = self.brake_table.item(row, 0)
+            if item0 is None:
+                continue
+            if item0.data(QtCore.Qt.UserRole) == src_i:
+                self.brake_table.blockSignals(True)
+                try:
+                    self.brake_table.setCurrentCell(row, 0)
+                    self.brake_table.selectRow(row)
+                    # self.brake_table.scrollToItem(item0, QtWidgets.QAbstractItemView.PositionAtCenter)
+                finally:
+                    self.brake_table.blockSignals(False)
+                return
+
+
     def on_delete_event_clicked(self):
-        # Figure out which button was clicked
         btn = self.sender()
         if btn is None:
             return
 
-        src_i = btn.property("src_i")
+        # --- figure out which *visible table row* this button is on (sorted order) ---
+        idx = self.brake_table.indexAt(
+            btn.mapTo(self.brake_table.viewport(), QtCore.QPoint(1, 1))
+        )
+        view_row = idx.row()
+        if view_row < 0:
+            return
+
+        # this is your stable pointer into self.braking_events
+        item0 = self.brake_table.item(view_row, 0)
+        if item0 is None:
+            return
+        src_i = item0.data(QtCore.Qt.UserRole)
         if src_i is None:
             return
         src_i = int(src_i)
@@ -346,79 +507,49 @@ class TracksPlayer(QtWidgets.QMainWindow):
             return
 
         ev = self.braking_events[src_i]
+        sql, params = self._build_delete_sql(ev)
 
-        video = ev.get("video", "")
-        track_id = ev.get("track_id", "")
-        t_start = ev.get("t_start", "")
-        created_at = ev.get("created_at", "")
+        # 1) UI: remove immediately
+        self.braking_events.pop(src_i)
+        self.status_label.setText("Deleting… (queued in background)")
+        self._refresh_brake_table_from_cache()
 
-        msg = (
-            "Are you sure you want to delete this braking event?\n\n"
-            f"video: {video}\n"
-            f"track_id: {track_id}\n"
-            f"t_start: {t_start}\n"
-            f"created_at: {created_at}\n\n"
-            "This will delete it from ClickHouse."
-        )
+        # 2) Background: execute ClickHouse mutation
+        self._start_delete_worker(sql, params=params)
 
-        resp = QtWidgets.QMessageBox.question(
-            self,
-            "Delete braking event",
-            msg,
-            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
-            QtWidgets.QMessageBox.No,
-        )
-        if resp != QtWidgets.QMessageBox.Yes:
+        # 3) Auto-select + play "next" in *table order*
+        nrows = self.brake_table.rowCount()
+        if nrows <= 0:
+            self.highlight_key = None
+            self.playing = False
+            self.status_label.setText("Deleted. No more events.")
             return
 
-        ok, err = self._delete_braking_event_in_clickhouse(ev)
-        if not ok:
-            QtWidgets.QMessageBox.critical(self, "Delete failed", err or "Unknown error")
-            return
+        # after deletion, the "next" row is the same view_row (it slides up),
+        # unless we deleted the last row, in which case pick the new last row
+        next_view_row = min(view_row, nrows - 1)
 
-        # Easiest/cleanest UI refresh: reload the table
-        self.status_label.setText("Delete queued (ClickHouse mutation). Refreshing list...")
-        self.on_load_braking_clicked()
-
-
-    def _delete_braking_event_in_clickhouse(self, ev: dict) -> tuple[bool, str]:
-        if self.ch is None:
-            return False, "ClickHouse client not initialized."
-
-        db = self.ch.db
-
-        # Pull fields used for identity
-        intersection_id = str(ev.get("intersection_id", "")).replace("'", "\\'")
-        approach_id = str(ev.get("approach_id", "")).replace("'", "\\'")
-        video = str(ev.get("video", "")).replace("'", "\\'")
-        track_id = int(ev.get("track_id", 0) or 0)
-
-        # Use floats carefully; keep consistent formatting
-        t_start = float(ev.get("t_start", 0.0) or 0.0)
-        t_end = float(ev.get("t_end", 0.0) or 0.0)
-
-        created_at = str(ev.get("created_at", "")).replace("'", "\\'")
-
-        # Mutation delete (async)
-        sql = f"""
-        ALTER TABLE {db}.braking_events
-        DELETE WHERE
-            intersection_id = '{intersection_id}'
-            AND approach_id = '{approach_id}'
-            AND video = '{video}'
-            AND track_id = {track_id}
-            AND t_start = {t_start}
-            AND t_end = {t_end}
-            AND created_at = '{created_at}'
-        """
-
+        self.brake_table.blockSignals(True)
         try:
-            # Use your existing HTTP helper
-            self.ch._post_sql(sql, use_db=True)
-        except Exception as e:
-            return False, str(e)
+            self.brake_table.setCurrentCell(next_view_row, 0)
+            self.brake_table.selectRow(next_view_row)
+            self.brake_table.scrollToItem(
+                self.brake_table.item(next_view_row, 0),
+                QtWidgets.QAbstractItemView.PositionAtCenter
+            )
+        finally:
+            self.brake_table.blockSignals(False)
 
-        return True, ""
+        # jump based on the selected row's src_i
+        item0_next = self.brake_table.item(next_view_row, 0)
+        if item0_next is None:
+            return
+        next_src_i = item0_next.data(QtCore.Qt.UserRole)
+        if next_src_i is None:
+            return
+        next_src_i = int(next_src_i)
+        if 0 <= next_src_i < len(self.braking_events):
+            self.jump_to_braking_event(self.braking_events[next_src_i])
 
 
     # ---- UI setup ----
@@ -770,8 +901,6 @@ class TracksPlayer(QtWidgets.QMainWindow):
             return
 
         db = self.ch.db
-        isect = intersection_id.replace("'", "\\'")
-        appr = approach_id.replace("'", "\\'")
 
         sql = f"""
         SELECT
@@ -789,83 +918,26 @@ class TracksPlayer(QtWidgets.QMainWindow):
             severity,
             created_at
         FROM {db}.braking_events
-        WHERE intersection_id = '{isect}'
-          AND approach_id = '{appr}'
+        WHERE intersection_id = {{intersection_id:String}}
+        AND approach_id = {{approach_id:String}}
         ORDER BY created_at DESC
-        LIMIT 200
         FORMAT JSONEachRow
         """
 
         try:
-            rows = ch_query_json_each_row(self.ch, sql)
+            rows = ch_query_json_each_row(
+                self.ch,
+                sql,
+                params={"intersection_id": intersection_id, "approach_id": approach_id},
+            )
         except Exception as e:
             self.status_label.setText(f"Error loading braking_events: {e}")
             return
 
         self.braking_events = rows
-        self._video_base_ts_cache.clear()
-        self.brake_table.setSortingEnabled(False)
-        self.brake_table.setRowCount(0)
-
-        for i, row in enumerate(rows):
-            video = row.get("video", "")
-            track_id = row.get("track_id", "")
-            t_start = float(row.get("t_start", 0.0) or 0.0)
-            dv = float(row.get("dv", 0.0) or 0.0)
-            a_min = float(row.get("a_min", 0.0) or 0.0)
-            cls = row.get("class", "")
-            severity = row.get("severity", "")
-
-            # Compute absolute event time using video base timestamp + t_start
-            base_ts = self._get_video_base_timestamp(video)
-            if base_ts is not None:
-                event_ts = (base_ts + timedelta(seconds=t_start)).isoformat(sep=" ")
-            else:
-                event_ts = ""
-
-            self.brake_table.insertRow(i)
-
-            values = [
-                video,
-                str(track_id),
-                cls,
-                f"{dv:.2f}",
-                f"{a_min:.2f}",
-                severity,
-                event_ts,
-            ]
-
-            for j, val in enumerate(values):
-                item = QtWidgets.QTableWidgetItem(val)
-
-                # Store the source index on the first column item (so sorting doesn't break double-click)
-                if j == 0:
-                    item.setData(QtCore.Qt.UserRole, i)
-
-                self.brake_table.setItem(i, j, item)
-
-            # After filling items 0..6, add delete button at col 7
-            btn = QtWidgets.QToolButton()
-            btn.setToolTip("Delete this event")
-            btn.setCursor(QtCore.Qt.PointingHandCursor)
-
-            style = self.style()
-            icon = style.standardIcon(QtWidgets.QStyle.SP_TrashIcon)
-            btn.setIcon(icon)
-
-            # Store the source index on the button too (robust even if table is re-sorted)
-            btn.setProperty("src_i", i)
-
-            btn.clicked.connect(self.on_delete_event_clicked)
-            self.brake_table.setCellWidget(i, 7, btn)
-
-
-        self.brake_table.setSortingEnabled(True)
-        self.brake_table.sortItems(6, QtCore.Qt.DescendingOrder)  # optional    
-
-
+        self._refresh_brake_table_from_cache()
         self.status_label.setText(
-            f"Loaded {len(rows)} braking events for {intersection_id}/{approach_id}. "
+            f"Loaded {len(self.braking_events)} braking events for {intersection_id}/{approach_id}. "
             "Double-click a row to jump."
         )
 
@@ -895,14 +967,13 @@ class TracksPlayer(QtWidgets.QMainWindow):
             return None
 
         db = self.ch.db
-        safe_video = video.replace("'", "\\'")
         sql = f"""
         SELECT min(timestamp) AS ts_min
         FROM {db}.raw
-        WHERE video = '{safe_video}'
+        WHERE video = {{video:String}}
         FORMAT JSONEachRow
         """
-        rows = ch_query_json_each_row(self.ch, sql)
+        rows = ch_query_json_each_row(self.ch, sql, params={"video": video})
         if not rows:
             return None
         ts_str = rows[0].get("ts_min")
@@ -915,20 +986,30 @@ class TracksPlayer(QtWidgets.QMainWindow):
         self._video_base_ts_cache[video] = ts
         return ts
 
+
     def jump_to_braking_event(self, ev: dict):
         if self.ch is None:
             self.status_label.setText("ClickHouse client not initialized.")
             return
 
         video = ev.get("video", "")
+        video_smooth = video.replace(".mp4", "_track_smooth.mp4")
         track_id = ev.get("track_id", None)
         t_start = float(ev.get("t_start", 0.0))
 
-        # Always scrub/play MP4 too (if available)
         if hasattr(self, "mp4_widget"):
-            lead = float(getattr(self, "jump_playback_lead_s", 3.0))
-            self.mp4_widget.jump_to(video=video, t_event_s=t_start, lead_s=lead, autoplay=True)
+            lead = 3.0  # or whatever constant you want
 
+            mp4_dir = Path(__file__).resolve().parent / "mp4s"
+            smooth_path = mp4_dir / video_smooth
+
+            if smooth_path.exists():
+                self.mp4_widget.jump_to(video=video_smooth, t_event_s=t_start, lead_s=lead, autoplay=True)
+            else:
+                # black screen: close unloads the cap and resets the label to the black background
+                self.mp4_widget.close()
+                self.status_label.setText(f"Missing smooth MP4: {video_smooth}")
+                return
 
 
         # Highlight this specific trajectory
