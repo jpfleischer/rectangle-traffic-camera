@@ -352,10 +352,168 @@ class TracksPlayer(QtWidgets.QMainWindow):
         self._load_ortho()
         self._init_clickhouse()
 
+        # Shift+D: delete selected braking event (no confirmation)
+        self.delete_shortcut = QtGui.QShortcut(QtGui.QKeySequence("Shift+D"), self)
+        self.delete_shortcut.setContext(QtCore.Qt.ApplicationShortcut)
+        self.delete_shortcut.activated.connect(self.on_shift_d_delete)
+
+        # Left/Right: prev/next braking event (table order)
+        self.prev_event_shortcut = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Left), self)
+        self.prev_event_shortcut.setContext(QtCore.Qt.ApplicationShortcut)
+        self.prev_event_shortcut.activated.connect(self.on_prev_braking_event)
+
+        self.next_event_shortcut = QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Right), self)
+        self.next_event_shortcut.setContext(QtCore.Qt.ApplicationShortcut)
+        self.next_event_shortcut.activated.connect(self.on_next_braking_event)
+
         # Timer for playback
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.on_timer)
         self.timer.start(self.gui_tick_ms)
+
+
+    def _jump_to_event_at_view_row(self, view_row: int) -> None:
+        if not hasattr(self, "brake_table"):
+            return
+        if view_row < 0 or view_row >= self.brake_table.rowCount():
+            return
+
+        item0 = self.brake_table.item(view_row, 0)
+        if item0 is None:
+            return
+
+        src_i = item0.data(QtCore.Qt.UserRole)
+        if src_i is None:
+            return
+        src_i = int(src_i)
+
+        if not (0 <= src_i < len(self.braking_events)):
+            return
+
+        # Select row (so UI stays in sync)
+        self.brake_table.blockSignals(True)
+        try:
+            self.brake_table.setCurrentCell(view_row, 0)
+            self.brake_table.selectRow(view_row)
+            self.brake_table.scrollToItem(item0, QtWidgets.QAbstractItemView.PositionAtCenter)
+        finally:
+            self.brake_table.blockSignals(False)
+
+        # Jump + autoplay
+        self.jump_to_braking_event(self.braking_events[src_i])
+
+
+    def on_next_braking_event(self) -> None:
+        """Right arrow: go to next braking event (table order)."""
+        if not hasattr(self, "brake_table"):
+            return
+        nrows = self.brake_table.rowCount()
+        if nrows <= 0:
+            return
+
+        cur = self.brake_table.currentRow()
+        if cur < 0:
+            cur = 0
+
+        next_row = min(cur + 1, nrows - 1)
+        if next_row == cur and cur != 0:
+            return  # already at end
+
+        self._jump_to_event_at_view_row(next_row)
+
+
+    def on_prev_braking_event(self) -> None:
+        """Left arrow: go to previous braking event (table order)."""
+        if not hasattr(self, "brake_table"):
+            return
+        nrows = self.brake_table.rowCount()
+        if nrows <= 0:
+            return
+
+        cur = self.brake_table.currentRow()
+        if cur < 0:
+            cur = 0
+
+        prev_row = max(cur - 1, 0)
+        if prev_row == cur:
+            return  # already at beginning
+
+        self._jump_to_event_at_view_row(prev_row)
+
+
+    def on_shift_d_delete(self):
+        """
+        Shift+D: if an event row is selected AND we are currently playing, delete it immediately.
+        No confirmation.
+        """
+        # only allow when playing (per your requirement)
+        if not getattr(self, "playing", False):
+            return
+
+        if not hasattr(self, "brake_table"):
+            return
+
+        view_row = self.brake_table.currentRow()
+        if view_row < 0:
+            return
+
+        item0 = self.brake_table.item(view_row, 0)
+        if item0 is None:
+            return
+
+        src_i = item0.data(QtCore.Qt.UserRole)
+        if src_i is None:
+            return
+        src_i = int(src_i)
+
+        if src_i < 0 or src_i >= len(self.braking_events):
+            return
+
+        ev = self.braking_events[src_i]
+        sql, params = self._build_delete_sql(ev)
+
+        # 1) UI: remove immediately
+        self.braking_events.pop(src_i)
+        self.status_label.setText("Deleting… (queued in background)")
+        self._refresh_brake_table_from_cache()
+
+        # 2) Background: execute ClickHouse mutation
+        self._start_delete_worker(sql, params=params)
+
+        # 3) Auto-select + play next in table order
+        nrows = self.brake_table.rowCount()
+        if nrows <= 0:
+            self.highlight_key = None
+            self.playing = False
+            self.status_label.setText("Deleted. No more events.")
+            return
+
+        next_view_row = min(view_row, nrows - 1)
+
+        self.brake_table.blockSignals(True)
+        try:
+            self.brake_table.setCurrentCell(next_view_row, 0)
+            self.brake_table.selectRow(next_view_row)
+            item_next0 = self.brake_table.item(next_view_row, 0)
+            if item_next0 is not None:
+                self.brake_table.scrollToItem(
+                    item_next0,
+                    QtWidgets.QAbstractItemView.PositionAtCenter
+                )
+        finally:
+            self.brake_table.blockSignals(False)
+
+        # Jump/play the newly selected row (keeps the "playing" flow)
+        item0_next = self.brake_table.item(next_view_row, 0)
+        if item0_next is None:
+            return
+        next_src_i = item0_next.data(QtCore.Qt.UserRole)
+        if next_src_i is None:
+            return
+        next_src_i = int(next_src_i)
+
+        if 0 <= next_src_i < len(self.braking_events):
+            self.jump_to_braking_event(self.braking_events[next_src_i])
 
 
     def _build_delete_sql(self, ev: dict) -> tuple[str, dict]:
