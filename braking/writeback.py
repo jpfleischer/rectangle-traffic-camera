@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import List
 
 import numpy as np
+import json
 
 from .chio import ClickHouseHTTP
 from .detect import BrakingEvent
@@ -41,42 +42,49 @@ def ensure_braking_events_schema(ch: ClickHouseHTTP) -> None:
     ch._post_sql(sql, use_db=False)
 
 
-def insert_braking_events(ch: ClickHouseHTTP, events: List[BrakingEvent]) -> None:
+def _dt64ms_to_str(dt64) -> str:
+    # "2026-01-02T23:45:40.123" -> "2026-01-02 23:45:40.123"
+    s = np.datetime_as_string(dt64, unit="ms")
+    return s.replace("T", " ")
+
+
+def insert_braking_events(ch: ClickHouseHTTP, events: List[BrakingEvent], chunk_size: int = 5000) -> None:
     if not events:
         return
 
     db = ch.db
-    values_lines = []
-    for ev in events:
-        isect = ev.intersection_id.replace("'", "\\'")
-        appr = ev.approach_id.replace("'", "\\'")
-        vid = ev.video.replace("'", "\\'")
-        cls = ev.cls.replace("'", "\\'")
 
-        if ev.event_ts is None:
-            ev_ts_sql = "NULL"
-        else:
-            ev_ts_sql = f"toDateTime64('{np.datetime_as_string(ev.event_ts, unit='ms')}', 3)"
+    # Insert using JSONEachRow to avoid massive VALUES(...) SQL strings
+    for i in range(0, len(events), chunk_size):
+        chunk = events[i : i + chunk_size]
 
-        values_lines.append(
-            f"('{isect}','{appr}','{vid}',{int(ev.track_id)},'{cls}',"
-            f"{ev.t_start},{ev.t_end},"
-            f"{ev.r_start},{ev.r_end},"
-            f"{ev.v_start},{ev.v_end},{ev.dv},"
-            f"{ev.a_min},{ev.avg_decel},'{ev.severity}',"
-            f"{ev_ts_sql})"
+        lines = []
+        for ev in chunk:
+            row = {
+                "intersection_id": ev.intersection_id,
+                "approach_id": ev.approach_id,
+                "video": ev.video,
+                "track_id": int(ev.track_id),
+                "class": ev.cls,
+                "t_start": float(ev.t_start),
+                "t_end": float(ev.t_end),
+                "r_start": float(ev.r_start),
+                "r_end": float(ev.r_end),
+                "v_start": float(ev.v_start),
+                "v_end": float(ev.v_end),
+                "dv": float(ev.dv),
+                "a_min": float(ev.a_min),
+                "avg_decel": float(ev.avg_decel),
+                "severity": ev.severity,
+                # Nullable(DateTime64(3)) accepts string or null in JSONEachRow
+                "event_ts": None if ev.event_ts is None else _dt64ms_to_str(ev.event_ts),
+            }
+            lines.append(json.dumps(row, separators=(",", ":")))
+
+        body = (
+            f"INSERT INTO {db}.braking_events FORMAT JSONEachRow\n"
+            + "\n".join(lines)
+            + "\n"
         )
 
-    sql = f"""
-    INSERT INTO {db}.braking_events
-    (
-        intersection_id, approach_id, video, track_id, class,
-        t_start, t_end,
-        r_start, r_end,
-        v_start, v_end, dv,
-        a_min, avg_decel, severity,
-        event_ts
-    )
-    VALUES {", ".join(values_lines)}
-    """
-    ch._post_sql(sql, use_db=False)
+        ch._post_sql(body, use_db=False)

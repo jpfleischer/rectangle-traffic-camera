@@ -93,7 +93,12 @@ class Mp4PlayerTab(QtWidgets.QWidget):
 
         self.video_label = QtWidgets.QLabel("MP4 tab: no video loaded")
         self.video_label.setAlignment(QtCore.Qt.AlignCenter)
-        self.video_label.setMinimumSize(640, 480)
+                
+        # ✅ allow splitter to shrink it
+        self.video_label.setMinimumSize(0, 0)
+        self.video_label.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
+                                    QtWidgets.QSizePolicy.Expanding)
+
         self.video_label.setStyleSheet("background-color: black; color: white;")
         layout.addWidget(self.video_label, stretch=1)
 

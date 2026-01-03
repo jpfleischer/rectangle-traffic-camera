@@ -103,24 +103,28 @@ class ClickHouseHTTP:
         params: Optional[dict] = None,
     ):
         """
-        POST parameterized SQL to ClickHouse HTTP interface.
+        POST SQL to ClickHouse HTTP interface using RAW body (not HTML form fields).
 
-        Use ClickHouse query parameters:
-        SQL:  ... WHERE video = {video:String}
-        params={"video": "foo.mp4"}  -> sent as param_video
+        Parameter substitution:
+        SQL:   ... WHERE video = {video:String}
+        params={"video": "foo.mp4"}  -> sent as param_video=foo.mp4
         """
         url = f"http://{self.host}:{self.port}/"
-        if use_db:
-            url += f"?database={self.db}"
 
-        files = {"query": (None, sql)}
+        # Use URL params (NOT form fields) to avoid Poco HTML form size limits
+        qparams = {}
+        if use_db:
+            qparams["database"] = self.db
+
         if params:
             for k, v in params.items():
-                files[f"param_{k}"] = (None, str(v))
+                qparams[f"param_{k}"] = str(v)
 
         r = self._session.post(
             url,
-            files=files,              # multipart/form-data, like the docs curl -F example
+            params=qparams,
+            data=sql.encode("utf-8"),  # <-- raw request body
+            headers={"Content-Type": "text/plain; charset=utf-8"},
             auth=self._auth,
             timeout=timeout or max(self.timeout, 10),
         )
