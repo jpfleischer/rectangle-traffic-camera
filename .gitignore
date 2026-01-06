@@ -4,3 +4,5 @@
 *jpg
 *.env
 __pycache__/
+*mp4
+*pdf

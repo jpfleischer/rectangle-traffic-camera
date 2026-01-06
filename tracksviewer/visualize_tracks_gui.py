@@ -16,13 +16,15 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from mp4_player import Mp4PlayerTab
 
-
-# --- ClickHouse client import (from gui/) ---
+# --- ClickHouse client import (from ../gui/) ---
 HERE = Path(__file__).resolve().parent
-dotenv_path = HERE / ".env"
-GUI_DIR = HERE / "gui"
+REPO_ROOT = HERE.parent
+
+dotenv_path = REPO_ROOT / ".env"
+
+GUI_DIR = REPO_ROOT / "gui"
 if str(GUI_DIR) not in sys.path:
-    sys.path.append(str(GUI_DIR))
+    sys.path.insert(0, str(GUI_DIR))
 
 from clickhouse_client import ClickHouseHTTP
 
@@ -346,7 +348,7 @@ class TracksPlayer(QtWidgets.QMainWindow):
         self.pre_event_seconds = 5.0
         self.post_event_seconds = 15.0
 
-        self.jump_playback_lead_s = 3.0
+        self.jump_playback_lead_s = 1.5
 
         self._build_ui()
         self._load_ortho()
@@ -1198,7 +1200,7 @@ class TracksPlayer(QtWidgets.QMainWindow):
         t_start = float(ev.get("t_start", 0.0))
 
         if hasattr(self, "mp4_widget"):
-            lead = 3.0  # or whatever constant you want
+            lead = float(getattr(self, "jump_playback_lead_s", 1.5))
 
             mp4_dir = Path(__file__).resolve().parent / "mp4s"
             smooth_path = mp4_dir / video_smooth
