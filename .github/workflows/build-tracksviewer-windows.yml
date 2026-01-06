@@ -39,6 +39,8 @@ jobs:
             --paths tracksviewer `
             --hidden-import clickhouse_client `
             --hidden-import mp4_player `
+            --hidden-import tracksviewer_app `
+            --collect-submodules tracksviewer_app `
             --collect-submodules PySide6 `
             --collect-submodules shiboken6 `
             --collect-submodules rasterio `
