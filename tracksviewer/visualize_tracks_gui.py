@@ -651,6 +651,8 @@ class TracksPlayer(QtWidgets.QMainWindow):
             return
 
         event_id = item0.data(QtCore.Qt.UserRole)
+        event_id = self._norm_event_id(event_id)
+
         if event_id is None:
             return
 
@@ -746,6 +748,8 @@ class TracksPlayer(QtWidgets.QMainWindow):
             return
 
         event_id = item0.data(QtCore.Qt.UserRole)
+        event_id = self._norm_event_id(event_id)
+
         if event_id is None:
             return
 
@@ -916,7 +920,7 @@ class TracksPlayer(QtWidgets.QMainWindow):
                 for j, val in enumerate(values):
                     item = QtWidgets.QTableWidgetItem(val)
                     if j == 0:
-                        item.setData(QtCore.Qt.UserRole, row["_event_id"])
+                        item.setData(QtCore.Qt.UserRole, tuple(row["_event_id"]))
                     self.brake_table.setItem(i, j, item)
 
                 btn = QtWidgets.QToolButton()
@@ -1435,13 +1439,29 @@ class TracksPlayer(QtWidgets.QMainWindow):
         )
 
 
+    def _norm_event_id(self, event_id):
+        if event_id is None:
+            return None
+
+        # PySide may give back list even if you stored tuple
+        if isinstance(event_id, list):
+            event_id = tuple(event_id)
+
+        # Normalize element types to match how you build ev_by_id keys
+        if isinstance(event_id, tuple) and len(event_id) == 5:
+            video, track_id, t_start, t_end, created_at = event_id
+            return (str(video), int(track_id), float(t_start), float(t_end), str(created_at))
+
+        return event_id
+
+
     def on_braking_event_activated(self, index: QtCore.QModelIndex):
         row = index.row()
         item0 = self.brake_table.item(row, 0)
         if item0 is None:
             return
 
-        event_id = item0.data(QtCore.Qt.UserRole)
+        event_id = self._norm_event_id(item0.data(QtCore.Qt.UserRole))
         if event_id is None:
             return
 
