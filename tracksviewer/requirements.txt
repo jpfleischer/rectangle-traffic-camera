@@ -5,3 +5,4 @@ PySide6
 keyring
 python-dotenv
 requests
+pyarrow

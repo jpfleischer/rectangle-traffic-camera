@@ -2,6 +2,7 @@
 import argparse
 
 from tracksviewer_app.paths import REPO_ROOT, init_env_and_sys_path
+init_env_and_sys_path()
 from tracksviewer_app.entrypoint import run
 
 
