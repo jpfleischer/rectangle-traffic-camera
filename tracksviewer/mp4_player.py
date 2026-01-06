@@ -70,7 +70,7 @@ class Mp4PlayerTab(QtWidgets.QWidget):
     def __init__(self, base_dir: Path, error_parent: Optional[QtWidgets.QWidget] = None, parent=None):
         super().__init__(parent)
         self.base_dir = Path(base_dir).resolve()
-        self.mp4_dir = self.base_dir / "mp4s"
+        self.mp4_dir = self._resolve_mp4_dir(self.base_dir)
         self.error_parent = error_parent or self
 
         # Playback state
@@ -86,6 +86,35 @@ class Mp4PlayerTab(QtWidgets.QWidget):
 
         self._build_ui()
         self._set_status("MP4 tab: no video loaded")
+
+
+    def _resolve_mp4_dir(self, base_dir: Path) -> Path:
+        """
+        Accept:
+        - base_dir that CONTAINS mp4s/ or mp4/
+        - base_dir that IS mp4s/ or mp4/
+        Return: folder that directly contains the .mp4 files.
+        """
+        p = Path(base_dir).resolve()
+        if p.is_dir() and p.name.lower() in ("mp4s", "mp4"):
+            return p
+        for name in ("mp4s", "mp4"):
+            child = p / name
+            if child.exists() and child.is_dir():
+                return child
+        return p  # fallback: assume p itself contains mp4 files
+
+
+    def set_base_dir(self, base_dir: Path) -> None:
+        """
+        Update where we look for MP4s.
+        If a video is currently open, close it so we don't keep a handle to the old path.
+        """
+        self.base_dir = Path(base_dir).resolve()
+        self.mp4_dir = self._resolve_mp4_dir(self.base_dir)
+        self.close()
+        self._set_status(f"MP4 folder set to: {self.mp4_dir}")
+
 
     # ---------------- UI ----------------
     def _build_ui(self):
@@ -140,7 +169,7 @@ class Mp4PlayerTab(QtWidgets.QWidget):
         if not path.exists():
             self._popup_error(
                 "Missing MP4",
-                f"Could not find:\n{path}\n\nExpected MP4s in a folder named 'mp4s' next to app.py."
+                f"Could not find:\n{path}\n\nCurrent MP4 folder is:\n{self.mp4_dir}"
             )
             return False
 

@@ -10,9 +10,11 @@ from datetime import datetime, timedelta
 import numpy as np
 import cv2
 import rasterio as rio
-from rasterio.transform import Affine
 
 from PySide6 import QtCore, QtGui, QtWidgets
+
+import keyring
+from keyring.errors import KeyringError
 
 from mp4_player import Mp4PlayerTab
 
@@ -31,12 +33,87 @@ from clickhouse_client import ClickHouseHTTP
 import dotenv
 dotenv.load_dotenv(str(dotenv_path), override=False)
 
+
+APP_ORG = "rectangle-traffic-camera"
+APP_NAME = "TracksViewer"
+SETTINGS_LAST_TIF = "paths/last_tif"
+SETTINGS_MP4_DIR = "paths/mp4_dir_resolved"
+SETTINGS_CH_HOST = "clickhouse/host"
+SETTINGS_CH_PORT = "clickhouse/port"
+SETTINGS_CH_USER = "clickhouse/user"
+SETTINGS_CH_DB   = "clickhouse/db"
+
+KEYRING_SERVICE  = "rectangle-traffic-camera/TracksViewer"
+KEYRING_ACCOUNT  = "clickhouse_password"   # entry name inside the service
+
+
+
 def ortho_units_to_m(src) -> float:
     try:
         return float(src.crs.linear_units_factor[1])
     except Exception:
         return 1.0
     
+
+class ClickHouseConfigDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None, host="", port=8123, user="default", password="", db="trajectories"):
+        super().__init__(parent)
+        self.setWindowTitle("Configure ClickHouse")
+        self.setModal(True)
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        form = QtWidgets.QFormLayout()
+        layout.addLayout(form)
+
+        self.host_edit = QtWidgets.QLineEdit(host)
+        self.port_spin = QtWidgets.QSpinBox()
+        self.port_spin.setRange(1, 65535)
+        self.port_spin.setValue(int(port) if port else 8123)
+
+        self.user_edit = QtWidgets.QLineEdit(user)
+        self.db_edit   = QtWidgets.QLineEdit(db)
+
+        self.pass_edit = QtWidgets.QLineEdit(password)
+        self.pass_edit.setEchoMode(QtWidgets.QLineEdit.Password)
+
+        self.show_pass = QtWidgets.QCheckBox("Show password")
+        self.show_pass.toggled.connect(
+            lambda on: self.pass_edit.setEchoMode(
+                QtWidgets.QLineEdit.Normal if on else QtWidgets.QLineEdit.Password
+            )
+        )
+
+        form.addRow("Host:", self.host_edit)
+        form.addRow("Port:", self.port_spin)
+        form.addRow("User:", self.user_edit)
+        form.addRow("Database:", self.db_edit)
+
+        pw_row = QtWidgets.QHBoxLayout()
+        pw_row.addWidget(self.pass_edit, 1)
+        pw_row.addWidget(self.show_pass)
+        form.addRow("Password:", pw_row)
+
+        info = QtWidgets.QLabel("Password is stored in the OS keychain (keyring).")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+        )
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        layout.addWidget(btns)
+
+    def values(self) -> dict:
+        return {
+            "host": self.host_edit.text().strip(),
+            "port": int(self.port_spin.value()),
+            "user": self.user_edit.text().strip(),
+            "db":   self.db_edit.text().strip(),
+            "password": self.pass_edit.text(),
+        }
+
 
 class DeleteWorker(QtCore.QObject):
     finished = QtCore.Signal(bool, str)  # ok, err
@@ -310,10 +387,31 @@ def numpy_to_qimage(frame: np.ndarray) -> QtGui.QImage:
 class TracksPlayer(QtWidgets.QMainWindow):
     def __init__(self, tif_path: str, parent=None):
         super().__init__(parent)
+
+        self.settings = QtCore.QSettings(APP_ORG, APP_NAME)
+
+        # MP4 base dir: where the mp4s/ folder is
+        saved_mp4_dir = self.settings.value(SETTINGS_MP4_DIR, "", type=str)
+        if saved_mp4_dir and Path(saved_mp4_dir).exists():
+            self.mp4_dir = Path(saved_mp4_dir)
+        else:
+            # default: next to app
+            self.mp4_dir = (REPO_ROOT / "mp4s") if (REPO_ROOT / "mp4s").exists() else REPO_ROOT
+
+
+        # If caller didn't provide a tif (or provided empty), try restoring last used
+        if not tif_path:
+            saved = self.settings.value(SETTINGS_LAST_TIF, "", type=str)
+            if saved and Path(saved).exists():
+                self.tif_path = saved
+            else:
+                self.tif_path = ""
+        else:
+            self.tif_path = tif_path
+
         self.setWindowTitle("Tracks Viewer (ClickHouse)")
 
         # --- State ---
-        self.tif_path = tif_path
         self.ortho_img: Optional[np.ndarray] = None
         self.disp_img: Optional[np.ndarray] = None
         self.m_per_px: float = 1.0
@@ -333,12 +431,26 @@ class TracksPlayer(QtWidgets.QMainWindow):
 
         self.gui_tick_ms = 40  # ~25 FPS
 
-        # ClickHouse config from env
-        self.ch_host = os.getenv("CH_HOST")
-        self.ch_port = int(os.getenv("CH_PORT", "8123"))
-        self.ch_user = os.getenv("CH_USER")
-        self.ch_password = os.getenv("CH_PASSWORD")
-        self.ch_db = os.getenv("CH_DB", "trajectories")
+        # ClickHouse config (QSettings + keyring; falls back to env/defaults)
+        try:
+            cfg = self._load_ch_config()
+        except Exception as e:
+            # Keyring is enforced — show once, keep env values as last resort for this run
+            QtWidgets.QMessageBox.critical(self, "Keyring error", str(e))
+            cfg = {
+                "host": os.getenv("CH_HOST", ""),
+                "port": int(os.getenv("CH_PORT", "8123")),
+                "user": os.getenv("CH_USER", "default"),
+                "password": os.getenv("CH_PASSWORD", ""),
+                "db": os.getenv("CH_DB", "trajectories"),
+            }
+
+        self.ch_host = cfg["host"]
+        self.ch_port = int(cfg["port"])
+        self.ch_user = cfg["user"]
+        self.ch_password = cfg["password"]
+        self.ch_db = cfg["db"]
+
 
         self.ch: Optional[ClickHouseHTTP] = None
 
@@ -351,7 +463,12 @@ class TracksPlayer(QtWidgets.QMainWindow):
         self.jump_playback_lead_s = 1.5
 
         self._build_ui()
-        self._load_ortho()
+        if self.tif_path and Path(self.tif_path).exists():
+            self._load_ortho()
+        else:
+            self.status_label.setText("No GeoTIFF selected yet. Click 'Choose TIF…'")
+            # keep image area black until user picks one
+
         self._init_clickhouse()
 
         # Shift+D: delete selected braking event (no confirmation)
@@ -372,6 +489,155 @@ class TracksPlayer(QtWidgets.QMainWindow):
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.on_timer)
         self.timer.start(self.gui_tick_ms)
+
+
+    def _load_ch_config(self) -> dict:
+        s = self.settings
+        # Prefer stored settings; else fall back to env; else defaults
+        host = s.value(SETTINGS_CH_HOST, os.getenv("CH_HOST", ""), type=str)
+        port = int(s.value(SETTINGS_CH_PORT, int(os.getenv("CH_PORT", "8123")), type=int))
+        user = s.value(SETTINGS_CH_USER, os.getenv("CH_USER", "default"), type=str)
+        db   = s.value(SETTINGS_CH_DB,   os.getenv("CH_DB", "trajectories"), type=str)
+
+        # ENFORCE keyring for password
+        pw = os.getenv("CH_PASSWORD", "")
+        try:
+            kr = keyring.get_password(KEYRING_SERVICE, KEYRING_ACCOUNT)
+            if kr is not None:
+                pw = kr
+        except KeyringError as e:
+            # If keyring is broken, treat as fatal for password retrieval
+            raise RuntimeError(f"Keyring error reading password: {e}") from e
+
+        return {"host": host, "port": port, "user": user, "db": db, "password": pw}
+
+
+    def _save_ch_config(self, cfg: dict) -> None:
+        # Store non-secrets in QSettings
+        self.settings.setValue(SETTINGS_CH_HOST, cfg.get("host", ""))
+        self.settings.setValue(SETTINGS_CH_PORT, int(cfg.get("port", 8123)))
+        self.settings.setValue(SETTINGS_CH_USER, cfg.get("user", "default"))
+        self.settings.setValue(SETTINGS_CH_DB,   cfg.get("db", "trajectories"))
+
+        # ENFORCE keyring for password
+        pw = cfg.get("password", "")
+        try:
+            keyring.set_password(KEYRING_SERVICE, KEYRING_ACCOUNT, pw)
+        except KeyringError as e:
+            raise RuntimeError(f"Keyring error saving password: {e}") from e
+
+        self.settings.sync()
+
+
+    def on_configure_clickhouse(self) -> None:
+        try:
+            cur = self._load_ch_config()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Keyring error", str(e))
+            return
+
+        dlg = ClickHouseConfigDialog(
+            self,
+            host=cur.get("host", ""),
+            port=cur.get("port", 8123),
+            user=cur.get("user", "default"),
+            password=cur.get("password", ""),
+            db=cur.get("db", "trajectories"),
+        )
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+
+        cfg = dlg.values()
+        if not cfg["host"]:
+            QtWidgets.QMessageBox.warning(self, "Invalid config", "Host is required.")
+            return
+        if not cfg["db"]:
+            QtWidgets.QMessageBox.warning(self, "Invalid config", "Database is required.")
+            return
+
+        try:
+            self._save_ch_config(cfg)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Keyring error", str(e))
+            return
+
+        # Apply immediately
+        self.ch_host = cfg["host"]
+        self.ch_port = int(cfg["port"])
+        self.ch_user = cfg["user"]
+        self.ch_password = cfg["password"]
+        self.ch_db = cfg["db"]
+
+        # Re-init client so subsequent queries use new credentials
+        try:
+            self._init_clickhouse()
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "ClickHouse init failed", str(e))
+            return
+
+        self.status_label.setText("Saved ClickHouse config (password stored in keyring).")
+
+
+    def _resolve_mp4_dir(self, chosen: Path) -> Path:
+        """
+        Accept either:
+        - a folder that CONTAINS mp4s/ or mp4/
+        - the mp4s/ folder itself (or mp4/)
+        Returns the folder that directly contains .mp4 files.
+        """
+        p = Path(chosen).resolve()
+
+        # If they selected mp4s/ or mp4/ directly
+        if p.is_dir() and p.name.lower() in ("mp4s", "mp4"):
+            return p
+
+        # If they selected the parent folder that contains mp4s/ or mp4/
+        for name in ("mp4s", "mp4"):
+            child = p / name
+            if child.exists() and child.is_dir():
+                return child
+
+        # Otherwise assume they selected the actual folder containing mp4s
+        return p
+
+
+    def on_choose_tif(self):
+        start_dir = str(Path(self.tif_path).parent) if self.tif_path else str(Path.cwd())
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select ortho GeoTIFF",
+            start_dir,
+            "GeoTIFF (*.tif *.tiff);;All files (*)",
+        )
+        if not path:
+            return
+
+        self.set_tif(path)
+
+    def set_tif(self, tif_path: str) -> None:
+        """Load a new GeoTIFF and refresh the ortho display."""
+        self.tif_path = tif_path
+
+        self.settings.setValue(SETTINGS_LAST_TIF, str(tif_path))
+        self.settings.sync()
+
+        if hasattr(self, "tif_label"):
+            p = Path(tif_path)
+            self.tif_label.setText(p.name)
+            self.tif_label.setToolTip(str(p))
+
+        self.status_label.setText(f"Loading GeoTIFF: {tif_path}")
+        QtWidgets.QApplication.processEvents()
+
+        try:
+            self._load_ortho()
+        except Exception as e:
+            self.status_label.setText(f"Failed to load GeoTIFF: {e}")
+            return
+
+        # Re-render current frame using new ortho (if tracks already loaded)
+        self._redraw_current_frame()
+        self.status_label.setText(f"Loaded GeoTIFF: {tif_path}")
 
 
     def _jump_to_event_at_view_row(self, view_row: int) -> None:
@@ -462,18 +728,17 @@ class TracksPlayer(QtWidgets.QMainWindow):
         self._jump_to_event_at_view_row(prev_row)
 
 
-    def on_shift_d_delete(self):
+    def _delete_event_at_view_row(self, view_row: int, jump_after: bool = True) -> None:
         """
-        Shift+D: delete selected braking event immediately (UI), submit CH delete in background,
-        then select + jump to the next row (table order).
+        Delete the braking event represented by the visible row `view_row`.
+        UI removes immediately (fast), ClickHouse mutation runs in background,
+        then optionally selects+jumps to next row.
         """
-        if not getattr(self, "playing", False):
-            return
         if not hasattr(self, "brake_table"):
             return
 
-        view_row = self.brake_table.currentRow()
-        if view_row < 0:
+        nrows = self.brake_table.rowCount()
+        if view_row < 0 or view_row >= nrows:
             return
 
         item0 = self.brake_table.item(view_row, 0)
@@ -486,7 +751,13 @@ class TracksPlayer(QtWidgets.QMainWindow):
 
         ev = getattr(self, "ev_by_id", {}).get(event_id)
         if ev is None:
-            return
+            # fallback scan (should be rare)
+            for e in getattr(self, "braking_events", []):
+                if e.get("_event_id") == event_id:
+                    ev = e
+                    break
+            if ev is None:
+                return
 
         sql, params = self._build_delete_sql(ev)
 
@@ -494,28 +765,66 @@ class TracksPlayer(QtWidgets.QMainWindow):
         if hasattr(self, "ev_by_id"):
             self.ev_by_id.pop(event_id, None)
 
-        # keep backing list consistent
         self.braking_events = [e for e in self.braking_events if e.get("_event_id") != event_id]
 
-        # remove visible row (no full rebuild)
+        # Remove visible row (no full rebuild)
         self.brake_table.removeRow(view_row)
         self.status_label.setText("Deleting… (queued in background)")
 
         # --- 2) Background delete (async) ---
         self._start_delete_worker(sql, params=params)
 
-        # --- 3) Move highlight + jump to next row ---
-        nrows = self.brake_table.rowCount()
-        if nrows <= 0:
+        # --- 3) Select + jump to next row (table order) ---
+        if not jump_after:
+            return
+
+        nrows2 = self.brake_table.rowCount()
+        if nrows2 <= 0:
             self.highlight_key = None
             self.playing = False
             self.status_label.setText("Deleted. No more events.")
             return
 
-        next_view_row = min(view_row, nrows - 1)
+        next_view_row = min(view_row, nrows2 - 1)
 
-        # IMPORTANT: let the table update after removeRow, then select+jump
+        # Let table update after removeRow, then force-select + jump (your robust method)
         QtCore.QTimer.singleShot(0, lambda r=next_view_row: self._jump_to_event_at_view_row(r))
+
+
+    def on_shift_d_delete(self) -> None:
+        """
+        Shift+D: delete selected braking event immediately, submit CH delete in background,
+        then select + jump to the next row (table order).
+        """
+        if not hasattr(self, "brake_table"):
+            return
+
+        view_row = self.brake_table.currentRow()
+        if view_row < 0:
+            return
+
+        self._delete_event_at_view_row(view_row, jump_after=True)
+
+
+    def on_delete_event_clicked(self) -> None:
+        """
+        Trash icon: delete that row immediately, submit CH delete in background,
+        then select + jump to the next row (table order).
+        """
+        btn = self.sender()
+        if btn is None or not hasattr(self, "brake_table"):
+            return
+
+        idx = self.brake_table.indexAt(
+            btn.mapTo(self.brake_table.viewport(), QtCore.QPoint(1, 1))
+        )
+        view_row = idx.row()
+        if view_row < 0:
+            return
+
+        self._delete_event_at_view_row(view_row, jump_after=True)
+
+
 
     def _build_delete_sql(self, ev: dict) -> tuple[str, dict]:
         db = self.ch.db
@@ -614,7 +923,6 @@ class TracksPlayer(QtWidgets.QMainWindow):
                 btn.setToolTip("Delete this event")
                 btn.setCursor(QtCore.Qt.PointingHandCursor)
                 btn.setIcon(self.style().standardIcon(QtWidgets.QStyle.SP_TrashIcon))
-                btn.setProperty("event_id", row["_event_id"])
                 btn.clicked.connect(self.on_delete_event_clicked)
                 self.brake_table.setCellWidget(i, 7, btn)
 
@@ -622,120 +930,65 @@ class TracksPlayer(QtWidgets.QMainWindow):
             self.brake_table.sortItems(6, QtCore.Qt.AscendingOrder)
         finally:
             self.brake_table.setUpdatesEnabled(True)
-  
-    def _select_brake_row_by_src_i(self, src_i: int) -> None:
-        # Find the visible table row whose column-0 item has UserRole == src_i
-        for row in range(self.brake_table.rowCount()):
-            item0 = self.brake_table.item(row, 0)
-            if item0 is None:
-                continue
-            if item0.data(QtCore.Qt.UserRole) == src_i:
-                self.brake_table.blockSignals(True)
-                try:
-                    self.brake_table.setCurrentCell(row, 0)
-                    self.brake_table.selectRow(row)
-                    # self.brake_table.scrollToItem(item0, QtWidgets.QAbstractItemView.PositionAtCenter)
-                finally:
-                    self.brake_table.blockSignals(False)
-                return
 
 
-    def on_delete_event_clicked(self):
-        btn = self.sender()
-        if btn is None or not hasattr(self, "brake_table"):
-            return
-
-        # --- find which visible row the clicked trash button is on ---
-        idx = self.brake_table.indexAt(
-            btn.mapTo(self.brake_table.viewport(), QtCore.QPoint(1, 1))
+    def on_choose_mp4_dir(self):
+        start_dir = str(self.mp4_dir) if hasattr(self, "mp4_dir") else str(REPO_ROOT)
+        path = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Select mp4s/ folder (or a folder that contains mp4s/)",
+            start_dir,
         )
-        view_row = idx.row()
-        if view_row < 0:
+        if not path:
+            return
+        self.set_mp4_dir(path)
+
+    def set_mp4_dir(self, chosen_dir: str) -> None:
+        chosen = Path(chosen_dir).resolve()
+        if not chosen.exists() or not chosen.is_dir():
+            self.status_label.setText(f"Not a directory: {chosen}")
             return
 
-        item0 = self.brake_table.item(view_row, 0)
-        if item0 is None:
+        resolved = self._resolve_mp4_dir(chosen)
+        if not resolved.exists() or not resolved.is_dir():
+            self.status_label.setText(f"Could not resolve mp4 folder from: {chosen}")
             return
 
-        # We now store a stable event_id tuple in UserRole (NOT an int index)
-        event_id = item0.data(QtCore.Qt.UserRole)
-        if event_id is None:
-            return
+        self.mp4_dir = resolved
 
-        # Look up the event dict
-        ev = getattr(self, "ev_by_id", {}).get(event_id)
-        if ev is None:
-            # fallback: try scanning braking_events (should be rare)
-            for e in self.braking_events:
-                if e.get("_event_id") == event_id:
-                    ev = e
-                    break
-            if ev is None:
-                return
+        # Persist resolved folder
+        self.settings.setValue(SETTINGS_MP4_DIR, str(self.mp4_dir))
+        self.settings.sync()
 
-        sql, params = self._build_delete_sql(ev)
+        # Update label
+        if hasattr(self, "mp4_label"):
+            self.mp4_label.setText(self.mp4_dir.name)
+            self.mp4_label.setToolTip(str(self.mp4_dir))
 
-        # -----------------------
-        # 1) UI: remove immediately (FAST)
-        # -----------------------
-        # Remove from cache structures
-        if hasattr(self, "ev_by_id") and event_id in self.ev_by_id:
-            self.ev_by_id.pop(event_id, None)
+        # ✅ CRITICAL: apply to the already-created mp4 widget
+        if hasattr(self, "mp4_widget") and self.mp4_widget is not None:
+            # Option A: Mp4PlayerTab supports changing base_dir dynamically
+            if hasattr(self.mp4_widget, "set_base_dir"):
+                self.mp4_widget.set_base_dir(self.mp4_dir)
+            else:
+                # Option B: recreate the widget in-place
+                self._recreate_mp4_widget()
 
-        # Keep braking_events list consistent (O(n) but n=1700 is fine; still WAY cheaper than rebuilding the table)
-        self.braking_events = [e for e in self.braking_events if e.get("_event_id") != event_id]
+        self.status_label.setText(f"MP4 folder set to: {self.mp4_dir}")
 
-        # Remove just this visible row from the table (no full rebuild)
-        self.brake_table.removeRow(view_row)
 
-        self.status_label.setText("Deleting… (queued in background)")
+    def _recreate_mp4_widget(self) -> None:
+        old = self.mp4_widget
+        self.mp4_widget = Mp4PlayerTab(base_dir=self.mp4_dir, error_parent=self)
 
-        # -----------------------
-        # 2) Background: execute ClickHouse mutation (already async)
-        # -----------------------
-        self._start_delete_worker(sql, params=params)
+        if hasattr(self, "left_splitter"):
+            # remove old widget from splitter cleanly
+            if old is not None:
+                old.setParent(None)
+                old.deleteLater()
 
-        # -----------------------
-        # 3) Immediately select + jump to next row (table order)
-        # -----------------------
-        nrows = self.brake_table.rowCount()
-        if nrows <= 0:
-            self.highlight_key = None
-            self.playing = False
-            self.status_label.setText("Deleted. No more events.")
-            return
-
-        next_view_row = min(view_row, nrows - 1)
-
-        # select next row without expensive scrolling
-        self.brake_table.blockSignals(True)
-        try:
-            self.brake_table.setCurrentCell(next_view_row, 0)
-            self.brake_table.selectRow(next_view_row)
-        finally:
-            self.brake_table.blockSignals(False)
-
-        # jump to the newly selected event
-        item0_next = self.brake_table.item(next_view_row, 0)
-        if item0_next is None:
-            return
-
-        next_event_id = item0_next.data(QtCore.Qt.UserRole)
-        if next_event_id is None:
-            return
-
-        next_ev = getattr(self, "ev_by_id", {}).get(next_event_id)
-        if next_ev is None:
-            # fallback scan
-            for e in self.braking_events:
-                if e.get("_event_id") == next_event_id:
-                    next_ev = e
-                    break
-
-        if next_ev is not None:
-            # NOTE: this may still block if jump_to_braking_event does ClickHouse queries.
-            # The big freeze you described was table rebuild; this eliminates that.
-            self.jump_to_braking_event(next_ev)
+            # mp4 should be at index 0
+            self.left_splitter.insertWidget(0, self.mp4_widget)
 
 
     # ---- UI setup ----
@@ -791,8 +1044,7 @@ class TracksPlayer(QtWidgets.QMainWindow):
         # -----------------------
         # Bottom widget: MP4 player
         # -----------------------
-        HERE = Path(__file__).resolve().parent
-        self.mp4_widget = Mp4PlayerTab(base_dir=HERE, error_parent=self)  # your existing class is fine as a widget
+        self.mp4_widget = Mp4PlayerTab(base_dir=self.mp4_dir, error_parent=self)
         
 
         self.left_splitter.addWidget(self.mp4_widget)   # TOP: video
@@ -846,6 +1098,38 @@ class TracksPlayer(QtWidgets.QMainWindow):
         self.load_button = QtWidgets.QPushButton("Load trajectories from ClickHouse")
         self.load_button.clicked.connect(self.on_load_clicked)
         right_layout.addWidget(self.load_button)
+
+        # --- Ortho / GeoTIFF chooser ---
+        tif_row = QtWidgets.QHBoxLayout()
+        right_layout.addLayout(tif_row)
+
+        self.tif_label = QtWidgets.QLabel(Path(self.tif_path).name if self.tif_path else "(no tif)")
+        self.tif_label.setToolTip(str(self.tif_path))
+        self.tif_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        tif_row.addWidget(self.tif_label, stretch=1)
+
+        self.choose_tif_button = QtWidgets.QPushButton("Choose TIF…")
+        self.choose_tif_button.clicked.connect(self.on_choose_tif)
+        tif_row.addWidget(self.choose_tif_button)
+
+        # --- MP4 folder chooser ---
+        mp4_row = QtWidgets.QHBoxLayout()
+        right_layout.addLayout(mp4_row)
+
+        self.mp4_label = QtWidgets.QLabel(self.mp4_dir.name if hasattr(self, "mp4_dir") else "(mp4s)")
+        self.mp4_label.setToolTip(str(getattr(self, "mp4_dir", "")))
+        self.mp4_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        mp4_row.addWidget(self.mp4_label, stretch=1)
+
+        self.choose_mp4_button = QtWidgets.QPushButton("Choose MP4 folder…")
+        self.choose_mp4_button.clicked.connect(self.on_choose_mp4_dir)
+        mp4_row.addWidget(self.choose_mp4_button)
+
+
+        self.choose_ch_button = QtWidgets.QPushButton("Configure ClickHouse…")
+        self.choose_ch_button.clicked.connect(self.on_configure_clickhouse)
+        right_layout.addWidget(self.choose_ch_button)
+
 
         # Status label
         self.status_label = QtWidgets.QLabel("")
@@ -969,6 +1253,12 @@ class TracksPlayer(QtWidgets.QMainWindow):
         self._redraw_current_frame()
 
     def on_load_clicked(self):
+
+        if not hasattr(self, "transform") or not hasattr(self, "units_to_m"):
+            self.status_label.setText("Choose a GeoTIFF first (needed for map->pixel projection).")
+            return
+
+
         if self.ch is None:
             self.status_label.setText("ClickHouse client not initialized.")
             return
@@ -1190,6 +1480,10 @@ class TracksPlayer(QtWidgets.QMainWindow):
 
 
     def jump_to_braking_event(self, ev: dict):
+        if not hasattr(self, "transform") or not hasattr(self, "units_to_m"):
+            self.status_label.setText("Choose a GeoTIFF first (needed for map->pixel projection).")
+            return
+
         if self.ch is None:
             self.status_label.setText("ClickHouse client not initialized.")
             return
@@ -1202,7 +1496,7 @@ class TracksPlayer(QtWidgets.QMainWindow):
         if hasattr(self, "mp4_widget"):
             lead = float(getattr(self, "jump_playback_lead_s", 1.5))
 
-            mp4_dir = Path(__file__).resolve().parent / "mp4s"
+            mp4_dir = self.mp4_dir
             smooth_path = mp4_dir / video_smooth
 
             if smooth_path.exists():
@@ -1303,8 +1597,8 @@ def main():
         description="ClickHouse-backed tracks viewer with datetime picker"
     )
     parser.add_argument(
-        "--tif", required=True,
-        help="Path to ortho GeoTIFF used for pairing"
+        "--tif", required=False, default="",
+        help="Path to ortho GeoTIFF used for pairing (optional; will restore last used)"
     )
     args = parser.parse_args()
 

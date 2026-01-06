@@ -57,10 +57,6 @@ jobs:
         run: |
           Compress-Archive -Path dist/TracksViewer/* -DestinationPath TracksViewer-windows.zip -Force
 
-      - name: Install jq
-        shell: pwsh
-        run: choco install jq -y
-
       - name: Compute next version tag (patch bump)
         id: version
         shell: bash
