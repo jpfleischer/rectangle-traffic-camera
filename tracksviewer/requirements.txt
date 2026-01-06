@@ -1,0 +1,6 @@
+numpy
+opencv-python-headless
+rasterio
+PySide6
+keyring
+python-dotenv
