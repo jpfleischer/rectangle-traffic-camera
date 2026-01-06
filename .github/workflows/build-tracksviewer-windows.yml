@@ -2,7 +2,7 @@ name: Build & Release TracksViewer (Windows)
 
 on:
   push:
-    branches: [ main ]   # or master
+    branches: [ main ]
   workflow_dispatch:
 
 permissions:
