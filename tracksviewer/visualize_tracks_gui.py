@@ -16,13 +16,13 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from mp4_player import Mp4PlayerTab
 
-# --- ClickHouse client import (from ../gui/) ---
+# --- ClickHouse client import (from ../roadpairer/) ---
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent
 
 dotenv_path = REPO_ROOT / ".env"
 
-GUI_DIR = REPO_ROOT / "gui"
+GUI_DIR = REPO_ROOT / "roadpairer"
 if str(GUI_DIR) not in sys.path:
     sys.path.insert(0, str(GUI_DIR))
 

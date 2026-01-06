@@ -3,9 +3,9 @@ import json
 from pathlib import Path
 from typing import List
 
-# Ensure we can import clickhouse_client from ../gui relative to this package (repo layout)
+# Ensure we can import clickhouse_client from ../roadpairer relative to this package (repo layout)
 HERE = Path(__file__).resolve().parent
-GUI_DIR = (HERE.parent / "gui").resolve()
+GUI_DIR = (HERE.parent / "roadpairer").resolve()
 if str(GUI_DIR) not in __import__("sys").path:
     import sys as _sys
     _sys.path.append(str(GUI_DIR))
