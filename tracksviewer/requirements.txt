@@ -6,3 +6,4 @@ keyring
 python-dotenv
 requests
 pyarrow
+pandas
