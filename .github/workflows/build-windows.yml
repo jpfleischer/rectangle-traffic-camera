@@ -152,8 +152,11 @@ jobs:
             --clean `
             --windowed `
             --name RoadPairer `
-            --paths roadpairer `
+            --paths . `
             --collect-submodules roadpairer `
+            --hidden-import roadpairer.ortho_overlay `
+            --hidden-import roadpairer.pair_points `
+            --hidden-import roadpairer.intersection_tab `
             --hidden-import roadpairer.clickhouse_client `
             --collect-submodules PySide6 `
             --collect-submodules shiboken6 `
@@ -167,6 +170,11 @@ jobs:
             --exclude-module PySide6.QtMultimedia `
             --exclude-module PySide6.QtMultimediaWidgets `
             roadpairer/app.py
+
+      - name: Show dist contents (debug)
+        shell: pwsh
+        run: |
+          Get-ChildItem -Recurse dist/RoadPairer | Select-Object FullName
 
       - name: Zip build folder
         shell: pwsh

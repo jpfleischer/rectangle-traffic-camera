@@ -14,7 +14,7 @@ import rasterio as rio
 from rasterio.enums import Resampling
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from roadpairer.ortho_overlay import save_overlay_figure
+from .ortho_overlay import save_overlay_figure
 
 
 # ---- I/O paths ----
