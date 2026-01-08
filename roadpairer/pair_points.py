@@ -109,10 +109,20 @@ class PairingTab(QtWidgets.QWidget):
         self.setWindowTitle("RoadPairer")
         self.resize(1400, 900)
 
-        # ---- load camera (with fallback dialog) ----
-        self.cam_bgr, self.cam_h, self.cam_w, self.cam_path = self._load_initial_camera()
+        # ---- load flags ----
+        self.cam_ok = False
+        self.ortho_ok = False
 
-        # ---- load ortho preview (with fallback dialog) ----
+        # ---- load camera (no startup prompts) ----
+        (
+            self.cam_bgr,
+            self.cam_h,
+            self.cam_w,
+            self.cam_path,
+            self.cam_ok,
+        ) = self._load_initial_camera()
+
+        # ---- load ortho preview (no startup prompts) ----
         (
             self.ortho_bgr_base,
             self.ortho_w,
@@ -121,6 +131,7 @@ class PairingTab(QtWidgets.QWidget):
             self.prev_h,
             self.prev_scale,
             self.ortho_path,
+            self.ortho_ok,
         ) = self._load_initial_ortho()
 
         # ---- pairing/interaction state ----
@@ -142,55 +153,24 @@ class PairingTab(QtWidgets.QWidget):
 
     def _load_initial_camera(self):
         """
-        Try to load CAM_PATH; if missing, ask the user to choose an image.
-        Returns (cam_bgr, cam_h, cam_w, cam_path).
+        Try to load CAM_PATH; if missing, use a black placeholder and mark as not-ok.
+        Returns (cam_bgr, cam_h, cam_w, cam_path, cam_ok).
         """
         cam_bgr = cv2.imread(CAM_PATH, cv2.IMREAD_COLOR)
         if cam_bgr is not None:
             h, w = cam_bgr.shape[:2]
-            return cam_bgr, h, w, CAM_PATH
+            return cam_bgr, h, w, CAM_PATH, True
 
-        # Fallback: prompt user
-        QtWidgets.QMessageBox.information(
-            self,
-            "Camera frame not found",
-            f"Could not read '{CAM_PATH}'.\n\n"
-            "Please select a camera frame image to use."
-        )
-
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self,
-            "Select camera frame image",
-            ".",
-            "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)"
-        )
-        if not path:
-            QtWidgets.QMessageBox.critical(
-                self,
-                "No camera image",
-                "RoadPairer needs a camera frame to start.\n"
-                "You can place one at 'camera_frame.png' next time, "
-                "or choose a file when prompted."
-            )
-            raise SystemExit("No camera image chosen")
-
-        cam_bgr = cv2.imread(path, cv2.IMREAD_COLOR)
-        if cam_bgr is None:
-            QtWidgets.QMessageBox.critical(
-                self,
-                "Load failed",
-                f"Could not read selected image:\n{path}"
-            )
-            raise SystemExit("Failed to load chosen camera image")
-
-        h, w = cam_bgr.shape[:2]
-        return cam_bgr, h, w, path
+        # No camera_frame.png: start with a black frame, non-interactive
+        h, w = 720, 1280
+        cam_bgr = np.zeros((h, w, 3), dtype=np.uint8)
+        return cam_bgr, h, w, "(none)", False
 
 
     def _load_initial_ortho(self):
         """
-        Try to load ORTHO_PATH; if missing, ask the user to choose a GeoTIFF.
-        Returns (ortho_bgr_base, ortho_w, ortho_h, prev_w, prev_h, prev_scale, ortho_path).
+        Try to load ORTHO_PATH; if missing, use a black placeholder and mark as not-ok.
+        Returns (ortho_bgr_base, ortho_w, ortho_h, prev_w, prev_h, prev_scale, ortho_path, ortho_ok).
         """
         def _load_from_path(path: str):
             with rio.open(path) as src:
@@ -212,46 +192,42 @@ class PairingTab(QtWidgets.QWidget):
 
         # Try default path first
         try:
-            ortho_bgr_base, ortho_w, ortho_h, prev_w, prev_h, prev_scale = _load_from_path(ORTHO_PATH)
-            return ortho_bgr_base, ortho_w, ortho_h, prev_w, prev_h, prev_scale, ORTHO_PATH
+            (
+                ortho_bgr_base,
+                ortho_w,
+                ortho_h,
+                prev_w,
+                prev_h,
+                prev_scale,
+            ) = _load_from_path(ORTHO_PATH)
+            return (
+                ortho_bgr_base,
+                ortho_w,
+                ortho_h,
+                prev_w,
+                prev_h,
+                prev_scale,
+                ORTHO_PATH,
+                True,
+            )
         except Exception:
             pass
 
-        # Fallback: prompt user
-        QtWidgets.QMessageBox.information(
-            self,
-            "Ortho image not found",
-            f"Could not read '{ORTHO_PATH}'.\n\n"
-            "Please select an ortho GeoTIFF image to use."
+        # No ortho_zoom.tif: use a black frame, non-interactive
+        ortho_h, ortho_w = 2048, 2048
+        ortho_bgr_base = np.zeros((ortho_h, ortho_w, 3), dtype=np.uint8)
+        prev_w, prev_h = ortho_w, ortho_h
+        prev_scale = 1.0
+        return (
+            ortho_bgr_base,
+            ortho_w,
+            ortho_h,
+            prev_w,
+            prev_h,
+            prev_scale,
+            "(none)",
+            False,
         )
-
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self,
-            "Select ortho GeoTIFF",
-            ".",
-            "GeoTIFF (*.tif *.tiff);;All files (*)"
-        )
-        if not path:
-            QtWidgets.QMessageBox.critical(
-                self,
-                "No ortho image",
-                "RoadPairer needs an ortho TIFF to start.\n"
-                "You can place one at 'ortho_zoom.tif' next time, "
-                "or choose a file when prompted."
-            )
-            raise SystemExit("No ortho image chosen")
-
-        try:
-            ortho_bgr_base, ortho_w, ortho_h, prev_w, prev_h, prev_scale = _load_from_path(path)
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(
-                self,
-                "Load failed",
-                f"Could not read selected ortho image:\n{path}\n\n{e}"
-            )
-            raise SystemExit("Failed to load chosen ortho image")
-
-        return ortho_bgr_base, ortho_w, ortho_h, prev_w, prev_h, prev_scale, path
 
 
     def _build_ui(self):
@@ -450,7 +426,8 @@ class PairingTab(QtWidgets.QWidget):
 
     def _swap_camera_image(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Choose new camera image", ".", "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)"
+            self, "Choose new camera image", ".",
+            "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)"
         )
         if not path:
             return
@@ -458,8 +435,12 @@ class PairingTab(QtWidgets.QWidget):
         if img is None:
             QtWidgets.QMessageBox.critical(self, "Load failed", f"Could not read image:\n{path}")
             return
+
         h, w = img.shape[:2]
-        if (h, w) != (self.cam_h, self.cam_w):
+        prev_ok = self.cam_ok
+
+        # Only enforce resolution match if we already had a real camera image
+        if prev_ok and (h, w) != (self.cam_h, self.cam_w):
             QtWidgets.QMessageBox.warning(
                 self, "Resolution mismatch",
                 f"Expected {self.cam_w}×{self.cam_h}, got {w}×{h}. "
@@ -467,11 +448,17 @@ class PairingTab(QtWidgets.QWidget):
             )
             return
 
-        # Accept swap (points retained because resolution matches)
+        # Accept swap
         self.cam_bgr = img
         self.cam_path = path
-        # keep cam_pts/map_pts as-is; invalidate any inlier coloring until next solve
-        self.inlier_mask = None
+        self.cam_h, self.cam_w = h, w
+        self.cam_ok = True
+
+        # If we were previously in dummy-black mode, clear any stale points
+        if not prev_ok:
+            self.cam_pts.clear()
+            self.map_pts.clear()
+            self.inlier_mask = None
 
         self._update_status(f"Swapped camera image to: {path}")
         self._draw_cam()
@@ -487,20 +474,21 @@ class PairingTab(QtWidgets.QWidget):
         if not path:
             return
 
+        prev_ok = self.ortho_ok
+
         try:
             with rio.open(path) as src:
                 ortho_w, ortho_h = src.width, src.height
 
-                # Require same resolution as existing one to keep map_pts meaningful
-                if hasattr(self, "ortho_w") and hasattr(self, "ortho_h"):
-                    if (ortho_w, ortho_h) != (self.ortho_w, self.ortho_h):
-                        QtWidgets.QMessageBox.warning(
-                            self,
-                            "Resolution mismatch",
-                            f"Expected {self.ortho_w}×{self.ortho_h}, got {ortho_w}×{ortho_h}.\n"
-                            "Swap cancelled to preserve existing ortho point coordinates."
-                        )
-                        return
+                # Require same resolution only if we already had a real ortho
+                if prev_ok and (ortho_w, ortho_h) != (self.ortho_w, self.ortho_h):
+                    QtWidgets.QMessageBox.warning(
+                        self,
+                        "Resolution mismatch",
+                        f"Expected {self.ortho_w}×{self.ortho_h}, got {ortho_w}×{ortho_h}.\n"
+                        "Swap cancelled to preserve existing ortho point coordinates."
+                    )
+                    return
 
                 nodata = src.nodata
                 bands = [1, 2, 3] if src.count >= 3 else [1]
@@ -530,13 +518,15 @@ class PairingTab(QtWidgets.QWidget):
         self.prev_w, self.prev_h = prev_w, prev_h
         self.prev_scale = prev_scale
         self.ortho_path = path
+        self.ortho_ok = True
 
-        # Keep map_pts as-is; inlier coloring becomes stale until next solve
-        self.inlier_mask = None
+        if not prev_ok:
+            self.cam_pts.clear()
+            self.map_pts.clear()
+            self.inlier_mask = None
 
         self._update_status(f"Swapped ortho TIFF to: {path}")
         self._draw_ortho()
-
 
     def _find_homography_compat(self, cam_arr, map_arr, thr_px=3.0):
         """
@@ -773,6 +763,13 @@ class PairingTab(QtWidgets.QWidget):
 
     # ---------- clicks ----------
     def _on_cam_click(self, x, y):
+        if not (self.cam_ok and self.ortho_ok):
+            self._update_status(
+                "Cannot add points until both camera and ortho images are loaded "
+                "(use Swap Camera Image… / Swap Ortho TIFF…)."
+            )
+            return
+
         view_w = max(1, self.cam_label.width())
         view_h = max(1, self.cam_label.height())
         base_scale = min(view_w / self.cam_w, view_h / self.cam_h)
@@ -783,9 +780,17 @@ class PairingTab(QtWidgets.QWidget):
         y_px = clamp(y_px, 0, self.cam_h - 1)
         self.cam_pts.append([x_px, y_px])
         self.inlier_mask = None
-        self._update_status(); self._draw_cam()
+        self._update_status()
+        self._draw_cam()
 
     def _on_ortho_click(self, x, y):
+        if not (self.cam_ok and self.ortho_ok):
+            self._update_status(
+                "Cannot add points until both camera and ortho images are loaded "
+                "(use Swap Camera Image… / Swap Ortho TIFF…)."
+            )
+            return
+
         view_w = max(1, self.ortho_label.width())
         view_h = max(1, self.ortho_label.height())
         base_scale = min(view_w / self.ortho_w, view_h / self.ortho_h)
@@ -796,7 +801,8 @@ class PairingTab(QtWidgets.QWidget):
         y_px = clamp(y_px, 0, self.ortho_h - 1)
         self.map_pts.append([x_px, y_px])
         self.inlier_mask = None
-        self._update_status(); self._draw_ortho()
+        self._update_status()
+        self._draw_ortho()
 
     # ---------- pan/zoom targeting the hovered pane ----------
     def _zoom_active(self, factor):
