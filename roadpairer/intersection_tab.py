@@ -88,25 +88,44 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
         super().__init__(parent)
         self.setWindowTitle("Intersection Geometry")
 
-        # ---- load ortho ----
-        with rio.open(ORTHO_PATH) as src:
-            self.ortho_w, self.ortho_h = src.width, src.height
-            self.ortho_transform: Affine = src.transform
-            nodata = src.nodata
-            bands = [1, 2, 3] if src.count >= 3 else [1]
-            self.prev_w = min(3000, self.ortho_w)
-            self.prev_h = max(
-                1, int(round(self.ortho_h * (self.prev_w / self.ortho_w)))
+        # ---- load ortho (tolerant) ----
+        self.ortho_ok = False
+        self._startup_warning = ""
+
+        try:
+            with rio.open(ORTHO_PATH) as src:
+                self.ortho_w, self.ortho_h = src.width, src.height
+                self.ortho_transform: Affine = src.transform
+                nodata = src.nodata
+                bands = [1, 2, 3] if src.count >= 3 else [1]
+                self.prev_w = min(3000, self.ortho_w)
+                self.prev_h = max(
+                    1, int(round(self.ortho_h * (self.prev_w / self.ortho_w)))
+                )
+                prev = src.read(
+                    bands,
+                    out_shape=(len(bands), self.prev_h, self.prev_w),
+                    resampling=Resampling.bilinear,
+                )
+                prev = np.moveaxis(prev, 0, 2)  # HWC
+                o8 = to_8bit_rgb(prev, nodata=nodata)
+                self.ortho_bgr_base = cv2.cvtColor(o8, cv2.COLOR_RGB2BGR)
+                self.prev_scale = self.prev_w / float(self.ortho_w)
+                self.ortho_ok = True
+        except Exception as e:
+            # Fallback: black canvas, identity transform, editing disabled
+            self.ortho_w, self.ortho_h = 2048, 2048
+            self.ortho_transform = Affine.identity()
+            self.prev_w = self.ortho_w
+            self.prev_h = self.ortho_h
+            self.prev_scale = 1.0
+            self.ortho_bgr_base = np.zeros(
+                (self.ortho_h, self.ortho_w, 3), dtype=np.uint8
             )
-            prev = src.read(
-                bands,
-                out_shape=(len(bands), self.prev_h, self.prev_w),
-                resampling=Resampling.bilinear,
+            self._startup_warning = (
+                f"Ortho TIFF '{ORTHO_PATH}' not found; showing blank map. "
+                "Geometry editing and saving are disabled until a real ortho is available."
             )
-            prev = np.moveaxis(prev, 0, 2)  # HWC
-            o8 = to_8bit_rgb(prev, nodata=nodata)
-            self.ortho_bgr_base = cv2.cvtColor(o8, cv2.COLOR_RGB2BGR)
-            self.prev_scale = self.prev_w / float(self.ortho_w)
 
         # pan/zoom
         self.ortho_zoom = 2.0
@@ -144,6 +163,11 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
         self._redraw_timer.timeout.connect(self.redraw)
 
         self.ensure_metadata_schema()
+
+        # If we started with no ortho, tell the user in the status bar
+        if self._startup_warning:
+            self.status_lbl.setText(self._startup_warning)
+
         self.redraw()
 
     # ---------------------- UI ---------------------- #
@@ -361,6 +385,13 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
         return x_px, y_px
 
     def _on_ortho_click(self, x, y):
+        if not self.ortho_ok:
+            self.status_lbl.setText(
+                f"No ortho TIFF loaded (expected '{ORTHO_PATH}'); "
+                "geometry editing is disabled."
+            )
+            return
+
         x_px, y_px = self._screen_to_px(x, y)
 
         if self.mode == "draw_stopbar":
@@ -469,6 +500,12 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
           - 2 divider points
           - intersection_id, approach_id
         """
+        if not self.ortho_ok:
+            self.status_lbl.setText(
+                f"Cannot save geometry: no ortho TIFF loaded (expected '{ORTHO_PATH}')."
+            )
+            return
+
         if len(self.stopbar_pts_px) != 2 or len(self.divider_pts_px) != 2:
             self.status_lbl.setText(
                 "Need both stop bar (2 pts) and divider (2 pts) before saving."
