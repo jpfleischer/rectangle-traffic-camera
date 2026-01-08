@@ -10,11 +10,13 @@ a_tv = Analysis(
     ['tracksviewer/visualize_tracks_gui.py'],
     pathex=['.', 'tracksviewer', 'roadpairer'],
     binaries=[],
-    datas=[],               # keep empty; let hooks handle data files
+    datas=[],  # let hooks handle data
     hiddenimports=[
         'mp4_player',
         'clickhouse_client',
         'tracksviewer_app',
+        # rasterio runtime dependency pulled in from C-extension:
+        'rasterio.serde',
     ],
     hookspath=[],
     hooksconfig={},
@@ -51,7 +53,7 @@ exe_tv = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,      # GUI app
+    console=False,  # GUI app
 )
 
 
@@ -60,12 +62,14 @@ a_rp = Analysis(
     ['roadpairer/app.py'],
     pathex=['.', 'roadpairer'],
     binaries=[],
-    datas=[],               # keep empty; let hooks handle data files
+    datas=[],  # let hooks handle data
     hiddenimports=[
         'roadpairer.ortho_overlay',
         'roadpairer.pair_points',
         'roadpairer.intersection_tab',
         'roadpairer.clickhouse_client',
+        # same rasterio issue here:
+        'rasterio.serde',
     ],
     hookspath=[],
     hooksconfig={},
@@ -102,7 +106,7 @@ exe_rp = EXE(
     upx=True,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=False,      # GUI app
+    console=False,  # GUI app
 )
 
 
