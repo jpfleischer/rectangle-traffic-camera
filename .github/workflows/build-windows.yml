@@ -13,29 +13,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  guard:
-    name: Guard (choose only one, build tv OR build rp)
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push'
-    steps:
-      - name: Enforce one build token
-        shell: bash
-        run: |
-          msg="${{ github.event.head_commit.message }}"
-          tv=0
-          rp=0
-          [[ "$msg" == *"build tv"* ]] && tv=1
-          [[ "$msg" == *"build rp"* ]] && rp=1
-          if [[ $tv -eq 1 && $rp -eq 1 ]]; then
-            echo "Error: use only one token: 'build tv' OR 'build rp' (not both)."
-            exit 1
-          fi
-
-  tracksviewer:
-    name: Build & Release TracksViewer (Windows)
-    needs: guard
+  build_both:
+    name: Build & Release TracksViewer + RoadPairer (Windows)
     runs-on: windows-latest
-    if: github.event_name == 'push' && contains(github.event.head_commit.message, 'build tv')
+    # Only run on push with "build it" in the commit message, or any manual dispatch
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, 'build it')
 
     steps:
       - uses: actions/checkout@v4
@@ -44,13 +26,16 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install requirements
+      - name: Install requirements (shared)
         shell: pwsh
         run: |
           python -m pip install --upgrade pip
           pip install -r tracksviewer/requirements.txt
           pip install pyinstaller
 
+      # --------------------------------------------------------
+      # TracksViewer build + release
+      # --------------------------------------------------------
       - name: Build EXE (PyInstaller) — TracksViewer
         shell: pwsh
         run: |
@@ -78,20 +63,19 @@ jobs:
             --exclude-module PySide6.QtMultimediaWidgets `
             tracksviewer/visualize_tracks_gui.py
 
-      - name: Zip build folder
+      - name: Zip build folder — TracksViewer
         shell: pwsh
         run: |
           Compress-Archive -Path dist/TracksViewer/* -DestinationPath TracksViewer-windows.zip -Force
 
       - name: Compute next version tag (tv patch bump)
-        id: version
+        id: version_tv
         shell: bash
         run: |
           set -e
           API="https://api.github.com/repos/$GITHUB_REPOSITORY/releases?per_page=100"
           LATEST="$(curl -fsSL "$API" | jq -r '[.[].tag_name | select(startswith("tv-v"))][0] // "tv-v0.0.0"')"
 
-          # Only bump if latest tag is tv-vX.Y.Z, else start at tv-v0.0.0
           if [[ -z "$LATEST" || "$LATEST" == "null" || "$LATEST" != tv-v* ]]; then
             LATEST="tv-v0.0.0"
           fi
@@ -103,47 +87,30 @@ jobs:
 
           echo "tag=tv-v${P[0]}.${P[1]}.${P[2]}" >> "$GITHUB_OUTPUT"
 
-      - name: Create GitHub Release
-        id: create_release
+      - name: Create GitHub Release — TracksViewer
+        id: create_release_tv
         uses: actions/create-release@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          release_name: TracksViewer ${{ steps.version.outputs.tag }}
+          tag_name: ${{ steps.version_tv.outputs.tag }}
+          release_name: TracksViewer ${{ steps.version_tv.outputs.tag }}
           draft: false
           prerelease: false
 
-      - name: Upload Release Asset
+      - name: Upload Release Asset — TracksViewer
         uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          upload_url: ${{ steps.create_release_tv.outputs.upload_url }}
           asset_path: TracksViewer-windows.zip
           asset_name: TracksViewer-windows.zip
           asset_content_type: application/zip
 
-  roadpairer:
-    name: Build & Release RoadPairer (Windows)
-    needs: guard
-    runs-on: windows-latest
-    if: github.event_name == 'push' && contains(github.event.head_commit.message, 'build rp')
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install requirements
-        shell: pwsh
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r roadpairer/requirements.txt
-          pip install pyinstaller
-
+      # --------------------------------------------------------
+      # RoadPairer build + release
+      # --------------------------------------------------------
       - name: Build EXE (PyInstaller) — RoadPairer
         shell: pwsh
         run: |
@@ -171,25 +138,24 @@ jobs:
             --exclude-module PySide6.QtMultimediaWidgets `
             roadpairer/app.py
 
-      - name: Show dist contents (debug)
+      - name: Show dist contents — RoadPairer (debug)
         shell: pwsh
         run: |
           Get-ChildItem -Recurse dist/RoadPairer | Select-Object FullName
 
-      - name: Zip build folder
+      - name: Zip build folder — RoadPairer
         shell: pwsh
         run: |
           Compress-Archive -Path dist/RoadPairer/* -DestinationPath RoadPairer-windows.zip -Force
 
       - name: Compute next version tag (rp patch bump)
-        id: version
+        id: version_rp
         shell: bash
         run: |
           set -e
           API="https://api.github.com/repos/$GITHUB_REPOSITORY/releases?per_page=100"
           LATEST="$(curl -fsSL "$API" | jq -r '[.[].tag_name | select(startswith("rp-v"))][0] // "rp-v0.0.0"')"
 
-          # Only bump if latest tag is rp-vX.Y.Z, else start at rp-v0.0.0
           if [[ -z "$LATEST" || "$LATEST" == "null" || "$LATEST" != rp-v* ]]; then
             LATEST="rp-v0.0.0"
           fi
@@ -201,23 +167,23 @@ jobs:
 
           echo "tag=rp-v${P[0]}.${P[1]}.${P[2]}" >> "$GITHUB_OUTPUT"
 
-      - name: Create GitHub Release
-        id: create_release
+      - name: Create GitHub Release — RoadPairer
+        id: create_release_rp
         uses: actions/create-release@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          release_name: RoadPairer ${{ steps.version.outputs.tag }}
+          tag_name: ${{ steps.version_rp.outputs.tag }}
+          release_name: RoadPairer ${{ steps.version_rp.outputs.tag }}
           draft: false
           prerelease: false
 
-      - name: Upload Release Asset
+      - name: Upload Release Asset — RoadPairer
         uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          upload_url: ${{ steps.create_release_rp.outputs.upload_url }}
           asset_path: RoadPairer-windows.zip
           asset_name: RoadPairer-windows.zip
           asset_content_type: application/zip
