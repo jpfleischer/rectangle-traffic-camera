@@ -2,8 +2,8 @@
 import sys
 from PySide6 import QtWidgets
 
-from roadpairer.pair_points import PairingTab
-from roadpairer.intersection_tab import IntersectionGeometryTab
+from pair_points import PairingTab
+from intersection_tab import IntersectionGeometryTab
 from pathlib import Path
 from dotenv import load_dotenv
 
