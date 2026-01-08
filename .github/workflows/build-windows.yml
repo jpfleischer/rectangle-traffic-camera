@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   guard:
-    name: Guard (choose only one: build tv OR build rp)
+    name: Guard (choose only one, build tv OR build rp)
     runs-on: ubuntu-latest
     if: github.event_name == 'push'
     steps:
