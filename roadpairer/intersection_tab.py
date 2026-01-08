@@ -13,12 +13,29 @@ from PySide6 import QtCore, QtGui, QtWidgets
 
 from roadpairer.clickhouse_client import ClickHouseHTTP
 
+import keyring
+from keyring.errors import KeyringError
+
+
 ORTHO_PATH = "ortho_zoom.tif"   # must match what you use elsewhere
 
 ACTIVE_BORDER   = "QLabel { border: 2px solid #4da3ff; }"
 INACTIVE_BORDER = "QLabel { border: 1px solid #555; }"
 
 US_SURVEY_FT_TO_M = 0.30480060960121924
+
+# --- ClickHouse config storage (local to RoadPairer) ---
+APP_ORG = "RectangleTraffic"
+APP_NAME = "RoadPairer"
+
+SETTINGS_CH_HOST = "ch_host"
+SETTINGS_CH_PORT = "ch_port"
+SETTINGS_CH_USER = "ch_user"
+SETTINGS_CH_DB   = "ch_db"
+
+KEYRING_SERVICE = "rectangle_traffic_clickhouse"
+KEYRING_ACCOUNT = "roadpairer_password"
+
 
 
 def to_8bit_rgb(arr, nodata=None):
@@ -74,6 +91,46 @@ class ClickLabel(QtWidgets.QLabel):
             pos = e.position() if hasattr(e, "position") else e.localPos()
             self.clicked.emit(int(pos.x()), int(pos.y()))
         super().mousePressEvent(e)
+
+
+class ClickHouseConfigDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None, host="", port=8123, user="default", password="", db="trajectories"):
+        super().__init__(parent)
+        self.setWindowTitle("Configure ClickHouse")
+
+        form = QtWidgets.QFormLayout(self)
+
+        self.host_edit = QtWidgets.QLineEdit(host)
+        self.port_spin = QtWidgets.QSpinBox()
+        self.port_spin.setRange(1, 65535)
+        self.port_spin.setValue(int(port) if port else 8123)
+
+        self.user_edit = QtWidgets.QLineEdit(user)
+        self.pw_edit = QtWidgets.QLineEdit(password)
+        self.pw_edit.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.db_edit = QtWidgets.QLineEdit(db)
+
+        form.addRow("Host:", self.host_edit)
+        form.addRow("Port:", self.port_spin)
+        form.addRow("User:", self.user_edit)
+        form.addRow("Password:", self.pw_edit)
+        form.addRow("Database:", self.db_edit)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addWidget(buttons)
+
+    def values(self) -> dict:
+        return {
+            "host": self.host_edit.text().strip(),
+            "port": int(self.port_spin.value()),
+            "user": self.user_edit.text().strip() or "default",
+            "password": self.pw_edit.text(),
+            "db": self.db_edit.text().strip() or "trajectories",
+        }
 
 
 class IntersectionGeometryTab(QtWidgets.QWidget):
@@ -141,20 +198,26 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
 
         self._shortcuts = []
 
-        # ClickHouse client (env-based config)
-        ch_host = os.getenv("CH_HOST", "example.com")
-        ch_port = int(os.getenv("CH_PORT", "8123"))
-        ch_user = os.getenv("CH_USER", "default")
-        ch_pass = os.getenv("CH_PASSWORD", "defaultpw")
-        ch_db   = os.getenv("CH_DB", "trajectories")
+        # --- ClickHouse config (lazy, like TracksViewer) ---
+        self.settings = QtCore.QSettings(APP_ORG, APP_NAME)
+        try:
+            cfg = self._load_ch_config()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Keyring error", str(e))
+            cfg = {
+                "host": os.getenv("CH_HOST", ""),
+                "port": int(os.getenv("CH_PORT", "8123")),
+                "user": os.getenv("CH_USER", "default"),
+                "password": os.getenv("CH_PASSWORD", ""),
+                "db": os.getenv("CH_DB", "trajectories"),
+            }
 
-        self.ch = ClickHouseHTTP(
-            host=ch_host,
-            port=ch_port,
-            user=ch_user,
-            password=ch_pass,
-            database=ch_db,
-        )
+        self.ch_host = cfg["host"]
+        self.ch_port = int(cfg["port"])
+        self.ch_user = cfg["user"]
+        self.ch_password = cfg["password"]
+        self.ch_db = cfg["db"]
+        self.ch = None  # <-- do not connect yet
 
         self._build_ui()
         self._connect_signals()
@@ -162,9 +225,6 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
         self._redraw_timer.setSingleShot(True)
         self._redraw_timer.timeout.connect(self.redraw)
 
-        self.ensure_metadata_schema()
-
-        # If we started with no ortho, tell the user in the status bar
         if self._startup_warning:
             self.status_lbl.setText(self._startup_warning)
 
@@ -232,6 +292,10 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
 
         db_box = QtWidgets.QGroupBox("Database")
         dl = QtWidgets.QVBoxLayout(db_box)
+
+        self.btn_config_ch = QtWidgets.QPushButton("Configure ClickHouse…")
+        dl.addWidget(self.btn_config_ch)
+
         self.btn_load_db = QtWidgets.QPushButton("Load from DB")
         self.btn_save_db = QtWidgets.QPushButton("Save to DB")
         dl.addWidget(self.btn_load_db)
@@ -267,6 +331,7 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
 
         self.btn_load_db.clicked.connect(self.load_from_db)
         self.btn_save_db.clicked.connect(self.save_to_db)
+        self.btn_config_ch.clicked.connect(self.on_configure_clickhouse)
 
         # Keyboard shortcuts for panning (WASD + arrows)
         def _make_shortcut(key, dx, dy):
@@ -431,6 +496,94 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
         self.status_lbl.setText("Geometry cleared.")
         self.redraw()
 
+    # -------- ClickHouse config / keyring (local, like TracksViewer) --------
+    def _load_ch_config(self) -> dict:
+        s = self.settings
+        host = s.value(SETTINGS_CH_HOST, os.getenv("CH_HOST", ""), type=str)
+        port = int(s.value(SETTINGS_CH_PORT, int(os.getenv("CH_PORT", "8123")), type=int))
+        user = s.value(SETTINGS_CH_USER, os.getenv("CH_USER", "default"), type=str)
+        db = s.value(SETTINGS_CH_DB, os.getenv("CH_DB", "trajectories"), type=str)
+
+        pw = os.getenv("CH_PASSWORD", "")
+        try:
+            kr = keyring.get_password(KEYRING_SERVICE, KEYRING_ACCOUNT)
+            if kr is not None:
+                pw = kr
+        except KeyringError as e:
+            raise RuntimeError(f"Keyring error reading password: {e}") from e
+
+        return {"host": host, "port": port, "user": user, "db": db, "password": pw}
+
+    def _save_ch_config(self, cfg: dict) -> None:
+        self.settings.setValue(SETTINGS_CH_HOST, cfg.get("host", ""))
+        self.settings.setValue(SETTINGS_CH_PORT, int(cfg.get("port", 8123)))
+        self.settings.setValue(SETTINGS_CH_USER, cfg.get("user", "default"))
+        self.settings.setValue(SETTINGS_CH_DB, cfg.get("db", "trajectories"))
+
+        pw = cfg.get("password", "")
+        try:
+            keyring.set_password(KEYRING_SERVICE, KEYRING_ACCOUNT, pw)
+        except KeyringError as e:
+            raise RuntimeError(f"Keyring error saving password: {e}") from e
+
+        self.settings.sync()
+
+    def _init_clickhouse(self) -> None:
+        self.ch = ClickHouseHTTP(
+            host=self.ch_host,
+            port=self.ch_port,
+            user=self.ch_user,
+            password=self.ch_password,
+            database=self.ch_db,
+        )
+
+    def on_configure_clickhouse(self) -> None:
+        try:
+            cur = self._load_ch_config()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Keyring error", str(e))
+            return
+
+        dlg = ClickHouseConfigDialog(
+            self,
+            host=cur.get("host", ""),
+            port=cur.get("port", 8123),
+            user=cur.get("user", "default"),
+            password=cur.get("password", ""),
+            db=cur.get("db", "trajectories"),
+        )
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+
+        cfg = dlg.values()
+        if not cfg["host"]:
+            QtWidgets.QMessageBox.warning(self, "Invalid config", "Host is required.")
+            return
+        if not cfg["db"]:
+            QtWidgets.QMessageBox.warning(self, "Invalid config", "Database is required.")
+            return
+
+        try:
+            self._save_ch_config(cfg)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Keyring error", str(e))
+            return
+
+        self.ch_host = cfg["host"]
+        self.ch_port = int(cfg["port"])
+        self.ch_user = cfg["user"]
+        self.ch_password = cfg["password"]
+        self.ch_db = cfg["db"]
+
+        try:
+            self._init_clickhouse()
+            self.ensure_metadata_schema()
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(self, "ClickHouse init failed", str(e))
+            return
+
+        self.status_lbl.setText("Saved ClickHouse config (password stored in keyring).")
+
     # ---------------------- DB schema + save/load ---------------------- #
 
     def ensure_metadata_schema(self):
@@ -439,6 +592,10 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
         Stores stop bar + divider line in both pixel and meter space,
         plus a braking window for analysis.
         """
+        if self.ch is None:
+            # Not configured yet; nothing to do
+            return
+
         db = self.ch.db
         sql = f"""
         CREATE TABLE IF NOT EXISTS {db}.stopbar_metadata
@@ -500,6 +657,10 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
           - 2 divider points
           - intersection_id, approach_id
         """
+        if self.ch is None:
+            self.status_lbl.setText("ClickHouse not configured. Use 'Configure ClickHouse…' first.")
+            return
+        
         if not self.ortho_ok:
             self.status_lbl.setText(
                 f"Cannot save geometry: no ortho TIFF loaded (expected '{ORTHO_PATH}')."
@@ -570,6 +731,9 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
         """
         Load latest geometry for the given intersection & approach.
         """
+        if self.ch is None:
+            self.status_lbl.setText("ClickHouse not configured. Use 'Configure ClickHouse…' first.")
+            return
         intersection_id = self.edit_intersection_id.text().strip()
         approach_id = self.edit_approach_id.text().strip()
         if not intersection_id or not approach_id:
