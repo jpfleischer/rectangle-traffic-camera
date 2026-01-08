@@ -7,14 +7,14 @@
 #  - Camera pane colored by inlier/outlier after solve (like ortho)
 
 
-import sys, json, time
+import json, time
 import numpy as np
 import cv2
 import rasterio as rio
 from rasterio.enums import Resampling
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from ortho_overlay import save_overlay_figure
+from .ortho_overlay import save_overlay_figure
 
 
 # ---- I/O paths ----
