@@ -88,8 +88,8 @@ jobs:
         shell: bash
         run: |
           set -e
-          API="https://api.github.com/repos/$GITHUB_REPOSITORY/releases/latest"
-          LATEST="$(curl -fsSL "$API" | jq -r .tag_name || true)"
+          API="https://api.github.com/repos/$GITHUB_REPOSITORY/releases?per_page=100"
+          LATEST="$(curl -fsSL "$API" | jq -r '[.[].tag_name | select(startswith("tv-v"))][0] // "tv-v0.0.0"')"
 
           # Only bump if latest tag is tv-vX.Y.Z, else start at tv-v0.0.0
           if [[ -z "$LATEST" || "$LATEST" == "null" || "$LATEST" != tv-v* ]]; then
@@ -153,10 +153,8 @@ jobs:
             --windowed `
             --name RoadPairer `
             --paths roadpairer `
-            --hidden-import pair_points `
-            --hidden-import intersection_tab `
-            --hidden-import ortho_overlay `
-            --hidden-import clickhouse_client `
+            --collect-submodules roadpairer `
+            --hidden-import roadpairer.clickhouse_client `
             --collect-submodules PySide6 `
             --collect-submodules shiboken6 `
             --collect-submodules rasterio `
@@ -180,8 +178,8 @@ jobs:
         shell: bash
         run: |
           set -e
-          API="https://api.github.com/repos/$GITHUB_REPOSITORY/releases/latest"
-          LATEST="$(curl -fsSL "$API" | jq -r .tag_name || true)"
+          API="https://api.github.com/repos/$GITHUB_REPOSITORY/releases?per_page=100"
+          LATEST="$(curl -fsSL "$API" | jq -r '[.[].tag_name | select(startswith("rp-v"))][0] // "rp-v0.0.0"')"
 
           # Only bump if latest tag is rp-vX.Y.Z, else start at rp-v0.0.0
           if [[ -z "$LATEST" || "$LATEST" == "null" || "$LATEST" != rp-v* ]]; then
