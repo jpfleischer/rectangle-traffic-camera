@@ -15,8 +15,11 @@ a_tv = Analysis(
         'mp4_player',
         'clickhouse_client',
         'tracksviewer_app',
-        # rasterio runtime dependency pulled in from C-extension:
+        # rasterio runtime deps pulled in from C-extensions:
         'rasterio.serde',
+        'rasterio.sample',
+        'rasterio.tools',
+        'rasterio.vrt',
     ],
     hookspath=[],
     hooksconfig={},
@@ -68,8 +71,11 @@ a_rp = Analysis(
         'roadpairer.pair_points',
         'roadpairer.intersection_tab',
         'roadpairer.clickhouse_client',
-        # same rasterio issue here:
+        # rasterio runtime deps:
         'rasterio.serde',
+        'rasterio.sample',
+        'rasterio.tools',
+        'rasterio.vrt',
     ],
     hookspath=[],
     hooksconfig={},
