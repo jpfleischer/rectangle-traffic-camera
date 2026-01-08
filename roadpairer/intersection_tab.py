@@ -11,7 +11,7 @@ from rasterio.enums import Resampling
 from affine import Affine
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from clickhouse_client import ClickHouseHTTP
+from roadpairer.clickhouse_client import ClickHouseHTTP
 
 ORTHO_PATH = "ortho_zoom.tif"   # must match what you use elsewhere
 
