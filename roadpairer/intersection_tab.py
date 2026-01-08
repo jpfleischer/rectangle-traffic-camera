@@ -11,10 +11,13 @@ from rasterio.enums import Resampling
 from affine import Affine
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from roadpairer.clickhouse_client import ClickHouseHTTP
+from .clickhouse_client import ClickHouseHTTP
+from .ch_config import (
+    load_clickhouse_config,
+    save_clickhouse_config,
+)
 
-import keyring
-from keyring.errors import KeyringError
+from .image_utils import to_8bit_rgb, cv_bgr_to_qimage, clamp
 
 
 ORTHO_PATH = "ortho_zoom.tif"   # must match what you use elsewhere
@@ -23,59 +26,6 @@ ACTIVE_BORDER   = "QLabel { border: 2px solid #4da3ff; }"
 INACTIVE_BORDER = "QLabel { border: 1px solid #555; }"
 
 US_SURVEY_FT_TO_M = 0.30480060960121924
-
-# --- ClickHouse config storage (local to RoadPairer) ---
-APP_ORG = "RectangleTraffic"
-APP_NAME = "RoadPairer"
-
-SETTINGS_CH_HOST = "ch_host"
-SETTINGS_CH_PORT = "ch_port"
-SETTINGS_CH_USER = "ch_user"
-SETTINGS_CH_DB   = "ch_db"
-
-KEYRING_SERVICE = "rectangle_traffic_clickhouse"
-KEYRING_ACCOUNT = "roadpairer_password"
-
-
-
-def to_8bit_rgb(arr, nodata=None):
-    if arr.ndim == 2:
-        arr = np.stack([arr, arr, arr], axis=2)
-    elif arr.shape[2] == 1:
-        arr = np.repeat(arr, 3, axis=2)
-    if arr.dtype == np.uint8:
-        return arr
-    o = arr.astype(np.float32, copy=True)
-    mask = None
-    if nodata is not None:
-        mask = np.any(arr == nodata, axis=2)
-
-    def pct(ch):
-        if mask is not None:
-            vals = ch[~mask]
-            if vals.size == 0:
-                return 0.0, 1.0
-            lo, hi = np.percentile(vals, (1, 99))
-        else:
-            lo, hi = np.percentile(ch, (1, 99))
-        if hi <= lo:
-            hi = lo + 1.0
-        return lo, hi
-
-    for c in range(o.shape[2]):
-        lo, hi = pct(o[..., c])
-        o[..., c] = np.clip((o[..., c] - lo) / (hi - lo) * 255.0, 0, 255)
-    return o.astype(np.uint8, copy=False)
-
-
-def cv_bgr_to_qimage(bgr: np.ndarray) -> QtGui.QImage:
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    h, w, ch = rgb.shape
-    return QtGui.QImage(rgb.data, w, h, ch * w, QtGui.QImage.Format_RGB888).copy()
-
-
-def clamp(v, lo, hi):
-    return max(lo, min(hi, v))
 
 
 class ClickLabel(QtWidgets.QLabel):
@@ -199,9 +149,8 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
         self._shortcuts = []
 
         # --- ClickHouse config (lazy, like TracksViewer) ---
-        self.settings = QtCore.QSettings(APP_ORG, APP_NAME)
         try:
-            cfg = self._load_ch_config()
+            cfg = load_clickhouse_config()
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Keyring error", str(e))
             cfg = {
@@ -496,37 +445,6 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
         self.status_lbl.setText("Geometry cleared.")
         self.redraw()
 
-    # -------- ClickHouse config / keyring (local, like TracksViewer) --------
-    def _load_ch_config(self) -> dict:
-        s = self.settings
-        host = s.value(SETTINGS_CH_HOST, os.getenv("CH_HOST", ""), type=str)
-        port = int(s.value(SETTINGS_CH_PORT, int(os.getenv("CH_PORT", "8123")), type=int))
-        user = s.value(SETTINGS_CH_USER, os.getenv("CH_USER", "default"), type=str)
-        db = s.value(SETTINGS_CH_DB, os.getenv("CH_DB", "trajectories"), type=str)
-
-        pw = os.getenv("CH_PASSWORD", "")
-        try:
-            kr = keyring.get_password(KEYRING_SERVICE, KEYRING_ACCOUNT)
-            if kr is not None:
-                pw = kr
-        except KeyringError as e:
-            raise RuntimeError(f"Keyring error reading password: {e}") from e
-
-        return {"host": host, "port": port, "user": user, "db": db, "password": pw}
-
-    def _save_ch_config(self, cfg: dict) -> None:
-        self.settings.setValue(SETTINGS_CH_HOST, cfg.get("host", ""))
-        self.settings.setValue(SETTINGS_CH_PORT, int(cfg.get("port", 8123)))
-        self.settings.setValue(SETTINGS_CH_USER, cfg.get("user", "default"))
-        self.settings.setValue(SETTINGS_CH_DB, cfg.get("db", "trajectories"))
-
-        pw = cfg.get("password", "")
-        try:
-            keyring.set_password(KEYRING_SERVICE, KEYRING_ACCOUNT, pw)
-        except KeyringError as e:
-            raise RuntimeError(f"Keyring error saving password: {e}") from e
-
-        self.settings.sync()
 
     def _init_clickhouse(self) -> None:
         self.ch = ClickHouseHTTP(
@@ -539,7 +457,7 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
 
     def on_configure_clickhouse(self) -> None:
         try:
-            cur = self._load_ch_config()
+            cur = load_clickhouse_config()
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Keyring error", str(e))
             return
@@ -564,7 +482,7 @@ class IntersectionGeometryTab(QtWidgets.QWidget):
             return
 
         try:
-            self._save_ch_config(cfg)
+            save_clickhouse_config(cfg)
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Keyring error", str(e))
             return

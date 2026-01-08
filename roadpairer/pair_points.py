@@ -14,8 +14,16 @@ import rasterio as rio
 from rasterio.enums import Resampling
 from PySide6 import QtCore, QtGui, QtWidgets
 
-from .ortho_overlay import save_overlay_figure
 
+from .image_utils import to_8bit_rgb, cv_bgr_to_qimage, clamp
+from .ortho_overlay import save_overlay_figure
+from .clickhouse_client import ClickHouseHTTP
+from .homography_store import save_homography_to_clickhouse
+
+# Reuse the same ClickHouse settings / keyring identifiers as IntersectionGeometryTab
+from .ch_config import (
+    load_clickhouse_config,
+)
 
 # ---- I/O paths ----
 CAM_PATH   = "camera_frame.png"
@@ -35,44 +43,6 @@ ACTIVE_BORDER   = "QLabel { border: 2px solid #4da3ff; }"
 INACTIVE_BORDER = "QLabel { border: 1px solid #555; }"
 
 
-def to_8bit_rgb(arr, nodata=None):
-    if arr.ndim == 2:
-        arr = np.stack([arr, arr, arr], axis=2)
-    elif arr.shape[2] == 1:
-        arr = np.repeat(arr, 3, axis=2)
-    if arr.dtype == np.uint8:
-        return arr
-    o = arr.astype(np.float32, copy=True)
-    mask = None
-    if nodata is not None:
-        mask = np.any(arr == nodata, axis=2)
-
-    def pct(ch):
-        if mask is not None:
-            vals = ch[~mask]
-            if vals.size == 0:
-                return 0.0, 1.0
-            lo, hi = np.percentile(vals, (1, 99))
-        else:
-            lo, hi = np.percentile(ch, (1, 99))
-        if hi <= lo:
-            hi = lo + 1.0
-        return lo, hi
-
-    for c in range(o.shape[2]):
-        lo, hi = pct(o[..., c])
-        o[..., c] = np.clip((o[..., c] - lo) / (hi - lo) * 255.0, 0, 255)
-    return o.astype(np.uint8, copy=False)
-
-
-def cv_bgr_to_qimage(bgr: np.ndarray) -> QtGui.QImage:
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-    h, w, ch = rgb.shape
-    return QtGui.QImage(rgb.data, w, h, ch * w, QtGui.QImage.Format_RGB888).copy()
-
-
-def clamp(v, lo, hi):
-    return max(lo, min(hi, v))
 
 
 class ClickLabel(QtWidgets.QLabel):
@@ -141,6 +111,11 @@ class PairingTab(QtWidgets.QWidget):
         self.ortho_zoom, self.ortho_pan_x, self.ortho_pan_y = 2.0, 0, 0
         self.active_pane = "ortho"
         self._shortcuts = []
+
+        # Last-used homography metadata (for ClickHouse saves)
+        self._last_isect_id = ""
+        self._last_approach_id = ""
+        self._last_h_tag = "cam_to_map"
 
         self._build_ui()
         self._connect_signals()
@@ -572,6 +547,115 @@ class PairingTab(QtWidgets.QWidget):
         return None, None, None
     
 
+    def _maybe_save_h_to_clickhouse(self, H: np.ndarray, method_name: str, n_pairs: int):
+        """
+        Ask the user for intersection/approach/tag and, if confirmed,
+        store H in ClickHouse via homography_store.save_homography_to_clickhouse.
+        """
+        # Simple dialog with 3 fields
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Save homography to ClickHouse")
+
+        form = QtWidgets.QFormLayout(dlg)
+
+        isect_edit = QtWidgets.QLineEdit(self._last_isect_id)
+        appr_edit = QtWidgets.QLineEdit(self._last_approach_id)
+        tag_edit = QtWidgets.QLineEdit(self._last_h_tag or "cam_to_map")
+
+        note_edit = QtWidgets.QLineEdit(f"{method_name}, {n_pairs} pairs")
+        form.addRow("Intersection ID:", isect_edit)
+        form.addRow("Approach ID:", appr_edit)
+        form.addRow("Tag:", tag_edit)
+        form.addRow("Note (optional):", note_edit)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+        )
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        form.addWidget(buttons)
+
+        # If user cancels, bail
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+
+        isect = isect_edit.text().strip()
+        appr = appr_edit.text().strip()
+        tag = tag_edit.text().strip() or "cam_to_map"
+        note = note_edit.text().strip()
+
+        if not isect or not appr:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Missing info",
+                "Intersection ID and Approach ID are required to save to ClickHouse.",
+            )
+            return
+
+        # Remember for next time
+        self._last_isect_id = isect
+        self._last_approach_id = appr
+        self._last_h_tag = tag
+
+        # Build ClickHouse client from the same GUI-managed config as IntersectionGeometryTab
+        try:
+            cfg = load_clickhouse_config()
+        except RuntimeError as e:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "ClickHouse config error",
+                str(e),
+            )
+            return
+
+        host = cfg["host"]
+        db   = cfg["db"]
+        port = int(cfg["port"])
+        user = cfg["user"]
+        pw   = cfg["password"]
+
+        if not host or not db:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "ClickHouse not configured",
+                "ClickHouse connection is not configured yet.\n\n"
+                "Open the 'Intersection Geometry' tab and use "
+                "'Configure ClickHouse…' to set host, port, user, database, and password.",
+            )
+            return
+
+        try:
+            ch = ClickHouseHTTP(
+                host=host,
+                port=port,
+                user=user,
+                password=pw,
+                database=db,
+            )
+            save_homography_to_clickhouse(
+                ch,
+                intersection_id=isect,
+                approach_id=appr,
+                tag=tag,
+                H=H,
+                note=note,
+            )
+        except Exception as e:
+            QtWidgets.QMessageBox.warning(
+                self,
+                "ClickHouse error",
+                f"Failed to save homography to ClickHouse:\n{e}",
+            )
+            return
+
+
+        QtWidgets.QMessageBox.information(
+            self,
+            "Homography saved",
+            f"Saved 3×3 H for ({isect}, {appr}, tag='{tag}') to ClickHouse.",
+        )
+    
+
     def _solve_robust_and_save(self):
         n = min(len(self.cam_pts), len(self.map_pts))
         if n < 4:
@@ -675,6 +759,10 @@ class PairingTab(QtWidgets.QWidget):
         self.results_box.setVisible(True)
 
         self._update_status("Solved with robust homography (inliers highlighted).")
+
+        # Optional: also save H into ClickHouse, with user-provided metadata
+        self._maybe_save_h_to_clickhouse(H, method_name, n)
+
         self.redraw_all()
 
 
