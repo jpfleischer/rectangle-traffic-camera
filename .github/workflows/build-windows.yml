@@ -152,7 +152,11 @@ jobs:
             --clean `
             --windowed `
             --name RoadPairer `
+            --paths . `
             --paths roadpairer `
+            --hidden-import roadpairer.ortho_overlay `
+            --hidden-import roadpairer.pair_points `
+            --hidden-import roadpairer.intersection_tab `
             --hidden-import clickhouse_client `
             --collect-submodules PySide6 `
             --collect-submodules shiboken6 `
