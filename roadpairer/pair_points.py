@@ -34,7 +34,7 @@ PTS_OUT    = "pairs_cam_to_map.json"   # <-- points saved/loaded here
 
 # ---- robust estimator settings ----
 H_METHOD = getattr(cv2, "USAC_MAGSAC", cv2.RANSAC)  # prefer MAGSAC++
-RANSAC_THRESH   = 10.0   # reprojection threshold in *ortho pixels*
+RANSAC_THRESH   = 15.0   # reprojection threshold in *ortho pixels*
 MAX_ITERS       = 10000
 CONFIDENCE      = 0.999
 REFINE_ITERS    = 10
@@ -43,6 +43,8 @@ ACTIVE_BORDER   = "QLabel { border: 2px solid #4da3ff; }"
 INACTIVE_BORDER = "QLabel { border: 1px solid #555; }"
 
 
+PAIR_W = 1280
+PAIR_H = 720
 
 
 class ClickLabel(QtWidgets.QLabel):
@@ -134,10 +136,20 @@ class PairingTab(QtWidgets.QWidget):
         cam_bgr = cv2.imread(CAM_PATH, cv2.IMREAD_COLOR)
         if cam_bgr is not None:
             h, w = cam_bgr.shape[:2]
+
+            # ✅ Enforce 1280x720 "pairer space" to match ultra pipeline
+            if (w, h) != (PAIR_W, PAIR_H):
+                print(
+                    f"[pair_points] Resizing camera image from {w}x{h} "
+                    f"to {PAIR_W}x{PAIR_H} for PAIR space"
+                )
+                cam_bgr = cv2.resize(cam_bgr, (PAIR_W, PAIR_H), interpolation=cv2.INTER_AREA)
+                h, w = PAIR_H, PAIR_W  # h=720, w=1280
+
             return cam_bgr, h, w, CAM_PATH, True
 
         # No camera_frame.png: start with a black frame, non-interactive
-        h, w = 720, 1280
+        h, w = PAIR_H, PAIR_W
         cam_bgr = np.zeros((h, w, 3), dtype=np.uint8)
         return cam_bgr, h, w, "(none)", False
 
@@ -412,30 +424,26 @@ class PairingTab(QtWidgets.QWidget):
             return
 
         h, w = img.shape[:2]
+
+        # ✅ Force into PAIR_W x PAIR_H so homography lives in the same space as ultra
+        if (w, h) != (PAIR_W, PAIR_H):
+            img = cv2.resize(img, (PAIR_W, PAIR_H), interpolation=cv2.INTER_AREA)
+            h, w = PAIR_H, PAIR_W
+
         prev_ok = self.cam_ok
 
-        # Only enforce resolution match if we already had a real camera image
-        if prev_ok and (h, w) != (self.cam_h, self.cam_w):
-            QtWidgets.QMessageBox.warning(
-                self, "Resolution mismatch",
-                f"Expected {self.cam_w}×{self.cam_h}, got {w}×{h}. "
-                "Swap cancelled to preserve existing point coordinates."
-            )
-            return
-
-        # Accept swap
+        # No more "must match old resolution" since we’ve standardized:
         self.cam_bgr = img
         self.cam_path = path
         self.cam_h, self.cam_w = h, w
         self.cam_ok = True
 
-        # If we were previously in dummy-black mode, clear any stale points
         if not prev_ok:
             self.cam_pts.clear()
             self.map_pts.clear()
             self.inlier_mask = None
 
-        self._update_status(f"Swapped camera image to: {path}")
+        self._update_status(f"Swapped camera image to: {path} (forced to {w}×{h})")
         self._draw_cam()
 
 
@@ -455,8 +463,8 @@ class PairingTab(QtWidgets.QWidget):
             with rio.open(path) as src:
                 ortho_w, ortho_h = src.width, src.height
 
-                # Require same resolution only if we already had a real ortho
-                if prev_ok and (ortho_w, ortho_h) != (self.ortho_w, self.ortho_h):
+                # ✅ Only lock resolution if we *already* had an ortho AND there are map points
+                if prev_ok and self.map_pts and (ortho_w, ortho_h) != (self.ortho_w, self.ortho_h):
                     QtWidgets.QMessageBox.warning(
                         self,
                         "Resolution mismatch",
@@ -687,8 +695,15 @@ class PairingTab(QtWidgets.QWidget):
         med  = float(np.median(errs_all[inl]))
         p95  = float(np.percentile(errs_all[inl], 95))
 
-        # Save H
-        np.save(H_OUT, H)
+        # ---- timestamped filenames to avoid clobbering ----
+        ts = time.strftime("%Y%m%d_%H%M%S")
+
+        # H with timestamp
+        if H_OUT.endswith(".npy"):
+            h_path = H_OUT.replace(".npy", f"_{ts}.npy")
+        else:
+            h_path = f"{H_OUT}_{ts}.npy"
+        np.save(h_path, H)
 
         # Warp to full ortho canvas with constant borders
         bev = cv2.warpPerspective(
@@ -711,8 +726,9 @@ class PairingTab(QtWidgets.QWidget):
         kernel = np.ones((3, 3), np.uint8)
         footprint = cv2.morphologyEx(footprint, cv2.MORPH_CLOSE, kernel, iterations=1)
 
-        # Save warp (use a distinct filename to not clobber LSQ result)
-        out_path = WARP_OUT.replace(".png", "_robust.png")
+        # Save warp with timestamp (robust)
+        base = WARP_OUT[:-4] if WARP_OUT.lower().endswith(".png") else WARP_OUT
+        out_path = f"{base}_robust_{ts}.png"
         cv2.imwrite(out_path, bev)
 
         overlay_path = out_path.replace(".png", "_overlay.png")
@@ -727,10 +743,10 @@ class PairingTab(QtWidgets.QWidget):
             outline_thickness=3,
         )
 
-
-        # Persist points JSON
+        # Persist points JSON with timestamp
         try:
-            pts_path = self._save_points()
+            pts_out = PTS_OUT.replace(".json", f"_{ts}.json") if PTS_OUT.endswith(".json") else f"{PTS_OUT}_{ts}.json"
+            pts_path = self._save_points(out_path=pts_out)
         except Exception as e:
             pts_path = f"(save failed: {e})"
 
@@ -751,7 +767,7 @@ class PairingTab(QtWidgets.QWidget):
             f"<b>Method</b>: {method_name}  |  <b>thr</b>: {RANSAC_THRESH:.1f} px<br>"
             f"<b>Pairs</b>: {n}  |  <b>Inliers</b>: {int(inl.sum())} ({100.0 * inl.mean():.1f}%)<br>"
             f"<b>RMSE@inliers</b>: {rmse:.2f}px  |  <b>Median</b>: {med:.2f}px  |  <b>P95</b>: {p95:.2f}px<br>"
-            f"Saved H → <code>{H_OUT}</code><br>"
+            f"Saved H → <code>{h_path}</code><br>"
             f"Saved warp → <code>{out_path}</code><br>"
             f"Saved points → <code>{pts_path}</code>"
         )
@@ -939,7 +955,10 @@ class PairingTab(QtWidgets.QWidget):
         self._update_status(); self._draw_ortho()
 
     # ---------- points I/O ----------
-    def _save_points(self):
+    def _save_points(self, out_path: str | None = None):
+        if out_path is None:
+            out_path = PTS_OUT
+
         data = {
             "created": time.strftime("%Y-%m-%d %H:%M:%S"),
             "camera": self.cam_path,          # <- use current path
@@ -947,9 +966,9 @@ class PairingTab(QtWidgets.QWidget):
             "cam_pts": self.cam_pts,
             "map_pts": self.map_pts,
         }
-        with open(PTS_OUT, "w", encoding="utf-8") as f:
+        with open(out_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
-        return PTS_OUT
+        return out_path
 
     def _load_points_dialog(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Load points JSON", ".", "JSON (*.json)")

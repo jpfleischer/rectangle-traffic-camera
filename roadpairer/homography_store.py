@@ -53,9 +53,8 @@ def save_homography_to_clickhouse(
     """
     Save a 3x3 homography as one row in homography_metadata.
 
-    - H is flattened row-major into 9 Float64 values.
-    - (intersection_id, approach_id, tag) is the logical key.
-    - created_at lets you keep history and always fetch "latest".
+    - If a row already exists for (intersection_id, approach_id, tag),
+      it is deleted before inserting the new one (logical overwrite).
     """
     ensure_homography_schema(ch)
 
@@ -66,19 +65,32 @@ def save_homography_to_clickhouse(
     flat = H.reshape(-1)
     vals = ",".join(str(float(x)) for x in flat)
 
+    # naive escaping: keep consistent with existing code
     isect_sql = intersection_id.replace("'", "\\'")
     appr_sql = approach_id.replace("'", "\\'")
-    tag_sql = tag.replace("'", "\\'")
+    tag_sql  = tag.replace("'", "\\'")
     note_sql = note.replace("'", "\\'")
 
     db = ch.db
-    sql = f"""
+
+    # 1) Delete any existing row for this logical key
+    delete_sql = f"""
+    ALTER TABLE {db}.homography_metadata
+    DELETE WHERE
+        intersection_id = '{isect_sql}' AND
+        approach_id     = '{appr_sql}' AND
+        tag             = '{tag_sql}'
+    """
+    ch._post_sql(delete_sql, use_db=False)
+
+    # 2) Insert the new homography row
+    insert_sql = f"""
     INSERT INTO {db}.homography_metadata
         (intersection_id, approach_id, tag, h_values, note)
     VALUES
         ('{isect_sql}', '{appr_sql}', '{tag_sql}', [{vals}], '{note_sql}')
     """
-    ch._post_sql(sql, use_db=False)
+    ch._post_sql(insert_sql, use_db=False)
 
 
 def load_latest_homography_from_clickhouse(

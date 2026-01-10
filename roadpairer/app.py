@@ -2,6 +2,8 @@
 import sys
 from PySide6 import QtWidgets
 
+from roadpairer.ortho_download_tab import OrthoDownloadTab
+from roadpairer.ortho_crop_tab import OrthoCropTab
 from roadpairer.pair_points import PairingTab
 from roadpairer.intersection_tab import IntersectionGeometryTab
 from pathlib import Path
@@ -19,11 +21,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
         tabs = QtWidgets.QTabWidget(self)
 
+        # --- Workflow order tabs ---
+        self.download_tab = OrthoDownloadTab()
+        self.crop_tab = OrthoCropTab()
         self.pairing_tab = PairingTab()
         self.geometry_tab = IntersectionGeometryTab()
 
-        tabs.addTab(self.pairing_tab, "Calibration (Pair Points)")
-        tabs.addTab(self.geometry_tab, "Intersection Geometry")
+        tabs.addTab(self.download_tab, "1. Download Ortho")
+        tabs.addTab(self.crop_tab, "2. Crop Ortho")
+        tabs.addTab(self.pairing_tab, "3. Calibration (Pair Points)")
+        tabs.addTab(self.geometry_tab, "4. Intersection Geometry")
 
         self.setCentralWidget(tabs)
 
