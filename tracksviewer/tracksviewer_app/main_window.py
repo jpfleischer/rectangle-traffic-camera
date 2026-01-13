@@ -579,6 +579,21 @@ class TracksPlayer(QtWidgets.QMainWindow):
         self.status_label.setWordWrap(True)
         right_layout.addWidget(self.status_label)
 
+        # --- Shared filters for both trajectories + braking events ---
+        filters_group = QtWidgets.QGroupBox("Intersection / approach filters")
+        filters_layout = QtWidgets.QFormLayout(filters_group)
+
+        self.intersection_edit = QtWidgets.QLineEdit()
+        self.approach_edit = QtWidgets.QLineEdit()
+        self.intersection_edit.setText("1")
+        self.approach_edit.setText("toward_cam_main")
+
+        filters_layout.addRow("Intersection ID:", self.intersection_edit)
+        filters_layout.addRow("Approach ID:", self.approach_edit)
+
+        right_layout.addWidget(filters_group)
+
+        # --- Separator before braking table section ---
         sep = QtWidgets.QFrame()
         sep.setFrameShape(QtWidgets.QFrame.HLine)
         sep.setFrameShadow(QtWidgets.QFrame.Sunken)
@@ -586,14 +601,6 @@ class TracksPlayer(QtWidgets.QMainWindow):
 
         right_layout.addWidget(QtWidgets.QLabel("Braking events (double-click to jump):"))
 
-        form = QtWidgets.QFormLayout()
-        self.intersection_edit = QtWidgets.QLineEdit()
-        self.approach_edit = QtWidgets.QLineEdit()
-        self.intersection_edit.setText("1")
-        self.approach_edit.setText("toward_cam_main")
-        form.addRow("Intersection ID:", self.intersection_edit)
-        form.addRow("Approach ID:", self.approach_edit)
-        right_layout.addLayout(form)
 
         self.load_brake_button = QtWidgets.QPushButton("Load braking events")
         self.load_brake_button.clicked.connect(self.on_load_braking_clicked)
@@ -663,6 +670,8 @@ class TracksPlayer(QtWidgets.QMainWindow):
         duration_s = float(self.duration_spin.value())
         video_filter = self.video_line.text().strip() or None
 
+        intersection_id = self.intersection_edit.text().strip() or None
+
         # -------- PARQUET MODE --------
         if self.data_mode == "parquet":
             if self.parquet_store is None:
@@ -677,6 +686,7 @@ class TracksPlayer(QtWidgets.QMainWindow):
                     start_dt=start_dt,
                     duration_s=duration_s,
                     video_filter=video_filter,
+                    intersection_id=intersection_id,
                 )
                 tracks, times, t0 = self._tracks_from_raw_df(df)
             except Exception as e:
@@ -703,6 +713,7 @@ class TracksPlayer(QtWidgets.QMainWindow):
                     transform=self.transform,
                     units_to_m=self.units_to_m,
                     video_filter=video_filter,
+                    intersection_id=intersection_id,
                 )
             except Exception as e:
                 self.status_label.setText(f"Error loading from ClickHouse: {e}")
@@ -1215,12 +1226,15 @@ class TracksPlayer(QtWidgets.QMainWindow):
         self.duration_spin.setValue(int(duration_s))
         self.video_line.setText(video)
 
+        intersection_id = ev.get("intersection_id", None)
+
         try:
             if self.data_mode == "parquet":
                 df = self.parquet_store.load_raw_interval(
                     start_dt=window_start,
                     duration_s=duration_s,
                     video_filter=video,
+                    intersection_id=intersection_id,                    
                 )
                 tracks, times, t0 = self._tracks_from_raw_df(df)
             else:
@@ -1231,6 +1245,7 @@ class TracksPlayer(QtWidgets.QMainWindow):
                     transform=self.transform,
                     units_to_m=self.units_to_m,
                     video_filter=video,
+                    intersection_id=intersection_id,
                 )
         except Exception as e:
             self.status_label.setText(f"Error loading tracks for event: {e}")

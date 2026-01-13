@@ -28,6 +28,7 @@ def load_tracks_interval(
     transform,
     units_to_m: float,
     video_filter: Optional[str] = None,
+    intersection_id: Optional[str] = None,
 ) -> Tuple[Dict[object, List[dict]], List[float], Optional[datetime]]:
     """
     Load tracks from trajectories.raw in ClickHouse for a time window.
@@ -40,7 +41,7 @@ def load_tracks_interval(
     end_dt = start_dt + timedelta(seconds=duration_s)
 
     start_str = start_dt.strftime("%Y-%m-%d %H:%M:%S")
-    end_str = end_dt.strftime("%Y-%m-%d %H:%M:%S")
+    end_str   = end_dt.strftime("%Y-%m-%d %H:%M:%S")
 
     db = ch.db
 
@@ -58,6 +59,11 @@ def load_tracks_interval(
     if video_filter:
         where += " AND video = {video:String}"
         params["video"] = video_filter
+
+    # NEW: optional intersection filter
+    if intersection_id is not None:
+        where += " AND intersection_id = {intersection_id:String}"
+        params["intersection_id"] = str(intersection_id)
 
     sql = f"""
     SELECT

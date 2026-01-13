@@ -173,39 +173,56 @@ class ParquetStore:
         start_dt: datetime,
         duration_s: float,
         video_filter: Optional[str] = None,
+        intersection_id: Optional[str] = None,
     ) -> pd.DataFrame:
         end_dt = start_dt + timedelta(seconds=float(duration_s))
 
         frames: List[pd.DataFrame] = []
-        cols = ["video", "timestamp", "track_id", "class", "map_m_x", "map_m_y"]
+
+        base_cols = ["video", "timestamp", "track_id", "class", "map_m_x", "map_m_y"]
+        # we *want* intersection_id if present, but old exports might not have it
+        extra_cols = ["intersection_id"]
+        cols = base_cols + extra_cols
 
         def _safe_video_name(v: str) -> str:
             # must match exporter’s folder-safe transform
             return v.replace("/", "_").replace("\\", "_")
 
+        def _read_part(part_path: Path) -> Optional[pd.DataFrame]:
+            if not part_path.exists():
+                return None
+            # try with intersection_id first; fall back if legacy
+            try:
+                return pd.read_parquet(part_path, columns=cols)
+            except (KeyError, ValueError):
+                return pd.read_parquet(part_path, columns=base_cols)
+
         for day in self._days_in_range(start_dt, end_dt):
-            # ---- NEW layout: raw/day=YYYY-MM-DD/video=.../part.parquet ----
+            # NEW layout: raw/day=YYYY-MM-DD/video=.../part.parquet
             day_dir = self.raw_dir / f"day={day.isoformat()}"
             if day_dir.exists() and day_dir.is_dir():
                 if video_filter:
                     vdir = day_dir / f"video={_safe_video_name(video_filter)}"
                     part = vdir / "part.parquet"
-                    if part.exists():
-                        frames.append(pd.read_parquet(part, columns=cols))
+                    df_part = _read_part(part)
+                    if df_part is not None:
+                        frames.append(df_part)
                 else:
-                    # load all videos for that day
                     for vdir in sorted(day_dir.glob("video=*/")):
                         part = vdir / "part.parquet"
-                        if part.exists():
-                            frames.append(pd.read_parquet(part, columns=cols))
+                        df_part = _read_part(part)
+                        if df_part is not None:
+                            frames.append(df_part)
 
-            # ---- OLD layout fallback: raw/part-YYYY-MM-DD.parquet ----
+            # OLD layout fallback: raw/part-YYYY-MM-DD.parquet
             old_part = self.raw_dir / f"part-{day.isoformat()}.parquet"
             if old_part.exists():
-                frames.append(pd.read_parquet(old_part, columns=cols))
+                df_part = _read_part(old_part)
+                if df_part is not None:
+                    frames.append(df_part)
 
         if not frames:
-            return pd.DataFrame(columns=cols)
+            return pd.DataFrame(columns=base_cols)
 
         df = pd.concat(frames, ignore_index=True)
 
@@ -218,6 +235,10 @@ class ParquetStore:
 
         if video_filter:
             df = df[df["video"] == video_filter]
+
+        # NEW: optional intersection filter, if column exists
+        if intersection_id is not None and "intersection_id" in df.columns:
+            df = df[df["intersection_id"].astype(str) == str(intersection_id)]
 
         df = df.sort_values(["timestamp", "video", "track_id"], kind="mergesort")
         return df
