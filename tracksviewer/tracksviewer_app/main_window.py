@@ -863,6 +863,7 @@ class TracksPlayer(QtWidgets.QMainWindow):
                 dv,
                 a_min,
                 severity,
+                event_ts,
                 created_at
             FROM {db}.braking_events
             WHERE intersection_id = {{intersection_id:String}}
@@ -943,7 +944,13 @@ class TracksPlayer(QtWidgets.QMainWindow):
                 severity = row.get("severity", "")
 
                 base_ts = self._get_video_base_timestamp(video)
-                if base_ts is not None:
+                event_ts_str = row.get("event_ts", "")
+
+                if event_ts_str:
+                    # Use the true event_ts from ClickHouse
+                    event_ts = event_ts_str
+                elif base_ts is not None:
+                    # Fallback for older rows with no event_ts column
                     event_ts = (base_ts + timedelta(seconds=t_start)).isoformat(sep=" ")
                 else:
                     event_ts = ""
@@ -1207,12 +1214,25 @@ class TracksPlayer(QtWidgets.QMainWindow):
 
         self.highlight_key = f"{video}#{track_id}" if track_id is not None else None
 
-        base_ts = self._get_video_base_timestamp(video)
-        if base_ts is None:
-            self.status_label.setText(f"Could not determine base timestamp for video {video}")
-            return
 
-        event_abs_start = base_ts + timedelta(seconds=t_start)
+        event_ts_str = ev.get("event_ts", "")
+
+        if event_ts_str:
+            try:
+                event_abs_start = datetime.fromisoformat(event_ts_str)
+            except Exception:
+                event_abs_start = None
+        else:
+            event_abs_start = None
+
+        if event_abs_start is None:
+            # Fallback to old behavior if event_ts missing or malformed
+            base_ts = self._get_video_base_timestamp(video)
+            if base_ts is None:
+                self.status_label.setText(f"Could not determine base timestamp for video {video}")
+                return
+            event_abs_start = base_ts + timedelta(seconds=t_start)
+
         pre = self.pre_event_seconds
         post = self.post_event_seconds
         window_start = event_abs_start - timedelta(seconds=pre)
