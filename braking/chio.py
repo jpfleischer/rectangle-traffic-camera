@@ -24,3 +24,16 @@ def ch_query_json_each_row(ch: ClickHouseHTTP, sql: str) -> List[dict]:
         if line:
             out.append(json.loads(line))
     return out
+
+def ch_query_arrow_table(ch: ClickHouseHTTP, sql: str):
+    """
+    Run a SQL query with FORMAT ArrowStream and return a pyarrow.Table.
+    """
+    import io
+    import pyarrow as pa
+    import pyarrow.ipc as pa_ipc
+
+    resp = ch._post_sql(sql, use_db=True)
+    buf = io.BytesIO(resp.content)
+    reader = pa_ipc.open_stream(buf)
+    return reader.read_all()

@@ -89,7 +89,11 @@ def main() -> None:
 
     logger.info("Using stopbar center=%s braking_window=%.1f m", geom.stopbar_center, geom.braking_window_m)
 
-    tracks = fetch_tracks(ch, video_filter=args.video)
+    tracks = fetch_tracks(
+        ch,
+        video_filter=args.video,
+        intersection_id=int(args.intersection_id),
+    )
     logger.info("Loaded %d tracks", len(tracks))
 
     accel_trigger_mps2 = float(args.accel_trigger) * G_STD
