@@ -42,9 +42,9 @@ INTERSECTION_META = {
         "label": "fig:hourlyevents_overseas_roosevelt",
     },
     "2": {
-        "tex_name": r"Truman Avenue / White Street",
-        "prefix": "truman_white",
-        "label": "fig:hourlyevents_truman_white",
+        "tex_name": r"White Street / Truman Avenue",
+        "prefix": "white_truman",
+        "label": "fig:hourlyevents_white_truman",
     },
 }
 
@@ -77,6 +77,164 @@ def hour_to_ampm(h: int) -> str:
     if h12 == 0:
         h12 = 12
     return f"{h12} {suffix}"
+
+
+def build_event_positions_from_parquet(
+    events: pd.DataFrame,
+    raw_root: Path,
+    intersection_id: str,
+    approach_id: str,
+    video: Optional[str] = None,
+    since: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    Offline version of fetch_event_positions_df using Parquet:
+    events (braking_events) + raw parquet under raw_root -> per-event col_px,row_px.
+    """
+    if events is None or events.empty:
+        return pd.DataFrame()
+
+    e = events.copy()
+    e["intersection_id"] = e["intersection_id"].astype(str)
+    e = e[e["intersection_id"] == str(intersection_id)]
+    e = e[e["approach_id"] == str(approach_id)]
+
+    if video is not None:
+        e = e[e["video"].astype(str) == str(video)]
+
+    if since is not None and "created_at" in e.columns:
+        e["created_at"] = pd.to_datetime(e["created_at"], errors="coerce", utc=True)
+        e = e[e["created_at"] >= pd.to_datetime(since, utc=True)]
+
+    if e.empty:
+        return pd.DataFrame()
+
+    raw_root = Path(raw_root)
+    if not raw_root.exists():
+        raise FileNotFoundError(f"raw parquet root not found: {raw_root}")
+
+    # Recursively find all parquet files under raw_root (day=.../video=.../part.parquet)
+    raw_parts = [pd.read_parquet(p) for p in raw_root.rglob("*.parquet")]
+
+    if not raw_parts:
+        print(f"No raw parquet files found under {raw_root}")
+        return pd.DataFrame()
+
+    raw = pd.concat(raw_parts, ignore_index=True)
+
+    raw["intersection_id"] = raw["intersection_id"].astype(str)
+    raw = raw[raw["intersection_id"] == str(intersection_id)]
+
+    if video is not None and "video" in raw.columns:
+        raw = raw[raw["video"].astype(str) == str(video)]
+
+    for c in ["secs", "map_px_x", "map_px_y"]:
+        if c in raw.columns:
+            raw[c] = pd.to_numeric(raw[c], errors="coerce")
+
+    e_join = e[
+        [
+            "intersection_id",
+            "approach_id",
+            "video",
+            "track_id",
+            "t_start",
+            "t_end",
+            "a_min",
+            "dv",
+            "severity",
+        ]
+    ].copy()
+
+    e_join["track_id"] = pd.to_numeric(e_join["track_id"], errors="coerce")
+    raw["track_id"] = pd.to_numeric(raw["track_id"], errors="coerce")
+
+    merged = raw.merge(
+        e_join,
+        on=["intersection_id", "video", "track_id"],
+        how="inner",
+        suffixes=("_raw", "_evt"),
+    )
+
+    merged = merged[
+        (merged["secs"] >= merged["t_start"])
+        & (merged["secs"] <= merged["t_end"])
+        & ((merged["map_px_x"] != 0) | (merged["map_px_y"] != 0))
+    ]
+
+    if merged.empty:
+        return pd.DataFrame()
+
+    grp_cols = [
+        "intersection_id",
+        "approach_id",
+        "video",
+        "track_id",
+        "t_start",
+        "t_end",
+        "a_min",
+        "dv",
+        "severity",
+    ]
+
+    grouped = (
+        merged
+        .groupby(grp_cols, as_index=False)
+        .agg(
+            col_px=("map_px_x", "mean"),
+            row_px=("map_px_y", "mean"),
+        )
+    )
+
+    for c in ["a_min", "dv", "col_px", "row_px"]:
+        grouped[c] = pd.to_numeric(grouped[c], errors="coerce")
+
+    grouped["decel_mag"] = -grouped["a_min"]
+    grouped.loc[~np.isfinite(grouped["decel_mag"]), "decel_mag"] = np.nan
+    grouped.loc[grouped["decel_mag"] < 0, "decel_mag"] = np.nan
+
+    return grouped
+
+
+def load_events_from_parquet(
+    parquet_path: Path,
+    intersection_id: str,
+    approach_id: str,
+    video: Optional[str] = None,
+    since: Optional[str] = None,
+) -> pd.DataFrame:
+    """Load braking_events from a local Parquet file and filter like fetch_events_df."""
+    df = pd.read_parquet(parquet_path)
+
+    # basic filtering to mimic the ClickHouse WHERE clause
+    df = df[df["intersection_id"].astype(str) == str(intersection_id)]
+    df = df[df["approach_id"].astype(str) == str(approach_id)]
+
+    if video is not None:
+        df = df[df["video"].astype(str) == str(video)]
+
+    if since is not None and "created_at" in df.columns:
+        df["created_at"] = pd.to_datetime(df["created_at"], errors="coerce", utc=True)
+        df = df[df["created_at"] >= pd.to_datetime(since, utc=True)]
+
+    if df.empty:
+        return df
+
+    # Make sure numeric columns are numeric
+    for c in ["t_start", "t_end", "r_start", "r_end",
+              "v_start", "v_end", "dv", "a_min", "avg_decel"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    if "a_min" not in df.columns:
+        raise RuntimeError("braking_events.a_min is missing in Parquet. Fix backup/schema.")
+
+    # braking strength magnitude (positive)
+    df["decel_mag"] = -df["a_min"]
+    df.loc[~np.isfinite(df["decel_mag"]), "decel_mag"] = np.nan
+    df.loc[df["decel_mag"] < 0, "decel_mag"] = np.nan
+
+    return df
 
 
 def fetch_events_df(
@@ -866,6 +1024,13 @@ def main() -> None:
     ap.add_argument("--heatmap-weight", choices=["count", "peak"], default="count",
                     help="Heatmap weights: count or peak (|a_min|).")
 
+    # NEW: optional local Parquet source for braking_events
+    ap.add_argument(
+        "--events-parquet",
+        default=None,
+        help="Optional Parquet file with braking_events; if provided, "
+             "events are loaded from this file instead of ClickHouse.",
+    )
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -874,27 +1039,67 @@ def main() -> None:
     default_prefix = meta.get("prefix", f"intersection_{args.intersection_id}")
     prefix = args.prefix or default_prefix
 
-    CH_HOST = os.getenv("CH_HOST", "example.com")
-    CH_PORT = int(os.getenv("CH_PORT", "8123"))
-    CH_USER = os.getenv("CH_USER", "default")
-    CH_PASSWORD = os.getenv("CH_PASSWORD", "")
-    CH_DB = os.getenv("CH_DB", "trajectories")
+    df = None
+    raw_root = None  # <- we'll infer this only in parquet mode
 
-    ch = ClickHouseHTTP(
-        host=CH_HOST,
-        port=CH_PORT,
-        user=CH_USER,
-        password=CH_PASSWORD,
-        database=CH_DB,
-    )
+    if args.events_parquet:
+        candidate = Path(args.events_parquet).resolve()
 
-    df = fetch_events_df(
-        ch,
-        intersection_id=args.intersection_id,
-        approach_id=args.approach_id,
-        video=args.video,
-        since=args.since,
-    )
+        if candidate.is_dir():
+            # User passed the backup root, e.g. exports_backup_before_extended_meters
+            backup_root = candidate
+            parquet_path = backup_root / "braking_events" / "braking_events.parquet"
+        else:
+            # User passed the parquet file directly
+            parquet_path = candidate
+            # go up from braking_events/ to the backup dir
+            backup_root = parquet_path.parent.parent
+
+        if not parquet_path.exists():
+            raise FileNotFoundError(f"Events Parquet not found: {parquet_path}")
+
+        print(f"Loading events from Parquet: {parquet_path}")
+        df = load_events_from_parquet(
+            parquet_path,
+            intersection_id=args.intersection_id,
+            approach_id=args.approach_id,
+            video=args.video,
+            since=args.since,
+        )
+
+        candidate_raw = backup_root / "raw"
+        if candidate_raw.exists():
+            raw_root = candidate_raw
+        else:
+            print(
+                f"Warning: inferred raw dir {candidate_raw} does not exist; "
+                "offline heatmap will not be available."
+            )
+
+        ch = None  # fully offline in this mode
+    else:
+        # normal ClickHouse mode
+        CH_HOST = os.getenv("CH_HOST", "example.com")
+        CH_PORT = int(os.getenv("CH_PORT", "8123"))
+        CH_USER = os.getenv("CH_USER", "default")
+        CH_PASSWORD = os.getenv("CH_PASSWORD", "")
+        CH_DB = os.getenv("CH_DB", "trajectories")
+
+        ch = ClickHouseHTTP(
+            host=CH_HOST,
+            port=CH_PORT,
+            user=CH_USER,
+            password=CH_PASSWORD,
+            database=CH_DB,
+        )
+
+        df = fetch_events_df(
+            ch,
+            intersection_id=args.intersection_id,
+            approach_id=args.approach_id,
+            video=args.video,
+            since=args.since,
+        )
 
     print(quantify_periods(df, restrict_hours_7_to_18_for_corr=True))
 
@@ -928,14 +1133,28 @@ def main() -> None:
     if args.tiff:
         tiff_path = Path(args.tiff)
 
-        # 1) Get per-event pixel positions from raw table
-        dfp = fetch_event_positions_df(
-            ch,
-            intersection_id=args.intersection_id,
-            approach_id=args.approach_id,
-            video=args.video,
-            since=args.since,
-        )
+        if args.events_parquet and raw_root is not None:
+            # fully offline: both braking_events and raw from parquet
+            dfp = build_event_positions_from_parquet(
+                events=df,
+                raw_root=raw_root,
+                intersection_id=args.intersection_id,
+                approach_id=args.approach_id,
+                video=args.video,
+                since=args.since,
+            )
+        elif ch is not None:
+            # online fallback
+            dfp = fetch_event_positions_df(
+                ch,
+                intersection_id=args.intersection_id,
+                approach_id=args.approach_id,
+                video=args.video,
+                since=args.since,
+            )
+        else:
+            print("No way to get raw positions for heatmap (no raw parquet and no ClickHouse).")
+            dfp = pd.DataFrame()
 
         if dfp.empty:
             print("No positioned events for heatmap.")
