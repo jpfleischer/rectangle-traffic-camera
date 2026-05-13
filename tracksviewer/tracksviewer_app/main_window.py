@@ -602,9 +602,18 @@ class TracksPlayer(QtWidgets.QMainWindow):
         right_layout.addWidget(QtWidgets.QLabel("Braking events (double-click to jump):"))
 
 
+        brake_buttons_layout = QtWidgets.QHBoxLayout()
+        right_layout.addLayout(brake_buttons_layout)
+        
         self.load_brake_button = QtWidgets.QPushButton("Load braking events")
         self.load_brake_button.clicked.connect(self.on_load_braking_clicked)
-        right_layout.addWidget(self.load_brake_button)
+        brake_buttons_layout.addWidget(self.load_brake_button)
+        
+        self.export_brake_button = QtWidgets.QPushButton("Export to XLSX")
+        self.export_brake_button.clicked.connect(self.on_export_braking_xlsx_clicked)
+        brake_buttons_layout.addWidget(self.export_brake_button)
+        
+        brake_buttons_layout.addStretch()
 
         self.brake_table = QtWidgets.QTableWidget(0, 8)
         self.brake_table.setHorizontalHeaderLabels([
@@ -1295,3 +1304,48 @@ class TracksPlayer(QtWidgets.QMainWindow):
         )
         self.playing = True
         self._redraw_current_frame()
+    def on_export_braking_xlsx_clicked(self) -> None:
+        """Export braking events to XLSX file."""
+        if not hasattr(self, 'braking_events') or not self.braking_events:
+            self.status_label.setText("No braking events loaded. Load events first.")
+            return
+
+        try:
+            # Convert list of dicts to DataFrame
+            df = pd.DataFrame(self.braking_events)
+            
+            # Generate filename with timestamp
+            now = datetime.now()
+            filename = f"braking_events_{now.strftime('%Y-%m-%d_%H-%M')}.xlsx"
+            
+            # Try to save to Downloads folder, fall back to repo root
+            downloads_dir = Path.home() / "Downloads"
+            if downloads_dir.exists():
+                filepath = downloads_dir / filename
+            else:
+                filepath = self.repo_root / filename
+            
+            # Write to Excel with formatting
+            with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
+                df.to_excel(writer, sheet_name='Braking Events', index=False)
+                
+                # Get the workbook and worksheet to apply formatting
+                workbook = writer.book
+                worksheet = writer.sheets['Braking Events']
+                
+                # Freeze the header row
+                worksheet.freeze_panes = 'A2'
+                
+                # Auto-fit column widths
+                for col_idx, col in enumerate(df.columns, 1):
+                    column_letter = chr(64 + col_idx)  # A, B, C, etc.
+                    max_length = max(
+                        len(str(col)),
+                        df[col].astype(str).str.len().max()
+                    )
+                    adjusted_width = min(max_length + 2, 50)  # Cap at 50 chars
+                    worksheet.column_dimensions[column_letter].width = adjusted_width
+            
+            self.status_label.setText(f"Exported {len(df)} braking events to {filepath}")
+        except Exception as e:
+            self.status_label.setText(f"Error exporting braking events: {e}")
