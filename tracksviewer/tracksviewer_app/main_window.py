@@ -10,6 +10,7 @@ import pandas as pd
 from collections import defaultdict
 import keyring
 from keyring.errors import KeyringError
+from openpyxl.utils import get_column_letter
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from mp4_player import Mp4PlayerTab
@@ -1318,19 +1319,25 @@ class TracksPlayer(QtWidgets.QMainWindow):
             now = datetime.now()
             filename = f"braking_events_{now.strftime('%Y-%m-%d_%H-%M')}.xlsx"
             
-            # Try to save to Downloads folder, fall back to repo root
+            # Suggest a default filename but let the user choose where to save it.
             downloads_dir = Path.home() / "Downloads"
-            if downloads_dir.exists():
-                filepath = downloads_dir / filename
-            else:
-                filepath = self.repo_root / filename
+            start_dir = downloads_dir if downloads_dir.exists() else self.repo_root
+            filepath, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self,
+                "Export braking events to XLSX",
+                str(start_dir / filename),
+                "Excel Workbook (*.xlsx)",
+            )
+            if not filepath:
+                self.status_label.setText("XLSX export canceled.")
+                return
+
+            filepath = Path(filepath).with_suffix(".xlsx")
             
             # Write to Excel with formatting
             with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
                 df.to_excel(writer, sheet_name='Braking Events', index=False)
                 
-                # Get the workbook and worksheet to apply formatting
-                workbook = writer.book
                 worksheet = writer.sheets['Braking Events']
                 
                 # Freeze the header row
@@ -1338,7 +1345,7 @@ class TracksPlayer(QtWidgets.QMainWindow):
                 
                 # Auto-fit column widths
                 for col_idx, col in enumerate(df.columns, 1):
-                    column_letter = chr(64 + col_idx)  # A, B, C, etc.
+                    column_letter = get_column_letter(col_idx)
                     max_length = max(
                         len(str(col)),
                         df[col].astype(str).str.len().max()
